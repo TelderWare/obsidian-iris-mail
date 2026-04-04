@@ -1,0 +1,12 @@
+# Dependencies
+node_modules/
+
+# Build output
+main.js
+
+# Cache
+cache/
+email-body-cache.json
+
+# Obsidian plugin data
+data.json

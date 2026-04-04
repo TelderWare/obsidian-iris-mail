@@ -1,0 +1,9 @@
+{
+  "id": "iris-mail",
+  "name": "Iris Mail",
+  "version": "0.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "View your Outlook email inbox inside Obsidian via Microsoft Graph API.",
+  "author": "mgodd",
+  "isDesktopOnly": true
+}

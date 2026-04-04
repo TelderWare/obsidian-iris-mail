@@ -1,0 +1,30 @@
+{
+  "name": "iris-mail",
+  "version": "0.1.0",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "test": "node test-plugin.mjs",
+    "test:fresh": "node test-plugin.mjs --fresh",
+    "test:list": "node test-plugin.mjs --no-build --list",
+    "test:unit": "jest"
+  },
+  "devDependencies": {
+    "@microsoft/microsoft-graph-types": "^2.40.0",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^20.0.0",
+    "@types/turndown": "^5.0.4",
+    "esbuild": "^0.21.0",
+    "jest": "^30.3.0",
+    "jest-environment-jsdom": "^30.3.0",
+    "obsidian": "^1.4.0",
+    "ts-jest": "^29.4.6",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "@azure/msal-node": "^3.0.0",
+    "@microsoft/microsoft-graph-client": "^3.0.0",
+    "turndown": "^7.1.0"
+  }
+}
