@@ -1,6 +1,11 @@
-import { requestUrl } from "obsidian";
+import { App, requestUrl } from "obsidian";
 import { expandDatePhrases } from "./dateFormat";
 import { logger } from "./logger";
+
+// ─── Relay integration ─────────────────────────────────────────
+
+let _app: App | undefined;
+export function setRelayApp(app: App): void { _app = app; }
 
 const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
 
@@ -23,6 +28,10 @@ interface CallClaudeOpts {
   maxTokens?: number;
   temperature?: number;
   errorLabel?: string;
+  /** Relay queue priority (0-10, lower = first). Defaults to 5. */
+  relayPriority?: number;
+  /** Mark as trivial — routed to a separate API key if configured. */
+  trivial?: boolean;
 }
 
 async function callClaude(
@@ -32,7 +41,22 @@ async function callClaude(
   userContent: string,
   opts: CallClaudeOpts = {},
 ): Promise<string> {
-  const { maxTokens = 4096, temperature = 0, errorLabel = "Claude API" } = opts;
+  const { maxTokens = 4096, temperature = 0, errorLabel = "Claude API", relayPriority, trivial } = opts;
+
+  // Route through Iris Relay when available
+  const relay = (_app as any)?.irisRelay;
+  if (relay) {
+    const json = await relay.request({
+      model,
+      max_tokens: maxTokens,
+      temperature,
+      system: systemPrompt,
+      messages: [{ role: "user", content: userContent }],
+    }, relayPriority, trivial);
+    const textBlock = (json.content as { type: string; text?: string }[] | undefined)
+      ?.find((block: { type: string }) => block.type === "text");
+    return (textBlock?.text || "").trim();
+  }
 
   let lastError: Error | null = null;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -117,6 +141,7 @@ export async function processEmailWithClaude(
     wrapEmailContent(emailContent), {
     maxTokens: 4096,
     temperature: 0.5,
+    relayPriority: 2,
   });
   if (!result) throw new Error("Claude API returned no text content");
   return scrubAiText(result);
@@ -133,6 +158,7 @@ export async function classifyEmailImportance(
     wrapEmailContent(emailContent), {
     maxTokens: 10,
     errorLabel: "Classification",
+    relayPriority: 2,
   })).toLowerCase();
 
   if (raw === "important" || raw === "routine" || raw === "noise") return raw;
@@ -154,6 +180,7 @@ export async function classifyEmailTags(
     userContent, {
     maxTokens: 100,
     errorLabel: "Tag classification",
+    relayPriority: 2,
   });
 
   try {
@@ -195,6 +222,7 @@ export async function refineTagPrompt(
   const result = await callClaude(apiKey, "claude-opus-4-6", systemPrompt, userContent, {
     maxTokens: 1024,
     errorLabel: "Prompt refinement",
+    relayPriority: 1,
   });
   if (!result) throw new Error("Opus returned empty prompt");
   return result;
@@ -223,6 +251,7 @@ export async function refineImportancePrompt(
   const result = await callClaude(apiKey, "claude-opus-4-6", systemPrompt, userContent, {
     maxTokens: 1024,
     errorLabel: "Importance prompt refinement",
+    relayPriority: 1,
   });
   if (!result) throw new Error("Opus returned empty prompt");
   return result;
@@ -237,6 +266,8 @@ export async function generateNickname(
   const result = await callClaude(apiKey, model, systemPrompt, rawName, {
     maxTokens: 30,
     errorLabel: "Nickname generation",
+    relayPriority: 2,
+    trivial: true,
   });
   return result || rawName;
 }
@@ -264,6 +295,7 @@ export async function mergeEmailsToFormula(
   const result = await callClaude(apiKey, "claude-haiku-4-5-20251001", systemPrompt, userContent, {
     maxTokens: 300,
     errorLabel: "Formula merge",
+    relayPriority: 1,
   });
   if (!result) throw new Error("Haiku returned empty formula");
   return result;
@@ -294,6 +326,7 @@ export async function refineTagPromptBulk(
   const result = await callClaude(apiKey, "claude-opus-4-6", systemPrompt, userContent, {
     maxTokens: 1024,
     errorLabel: "Bulk tag prompt refinement",
+    relayPriority: 1,
   });
   if (!result) throw new Error("Opus returned empty prompt");
   return result;
@@ -325,6 +358,7 @@ export async function refineImportancePromptBulk(
   const result = await callClaude(apiKey, "claude-opus-4-6", systemPrompt, userContent, {
     maxTokens: 1024,
     errorLabel: "Bulk importance prompt refinement",
+    relayPriority: 1,
   });
   if (!result) throw new Error("Opus returned empty prompt");
   return result;
@@ -369,6 +403,7 @@ export async function detectItemsInEmail(
     maxTokens: 2048,
     temperature: 0,
     errorLabel: "Item detection",
+    relayPriority: 2,
   });
 
   // Strip markdown code fences that Claude sometimes wraps around JSON
@@ -474,6 +509,7 @@ export async function extractNoteFromSelection(
     maxTokens: 1024,
     temperature: 0,
     errorLabel: "Note extraction",
+    relayPriority: 1,
   });
 
   try {

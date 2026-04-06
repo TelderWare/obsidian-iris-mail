@@ -10,6 +10,7 @@ import {
   DEFAULT_SETTINGS,
 } from "./constants";
 import { logger, setDebugEnabled } from "./utils/logger";
+import { setRelayApp } from "./utils/claudeApi";
 import type { AuthMethod, IrisMailSettings, AuthState, Message } from "./types";
 
 /** Encrypt a string using Electron's safeStorage if available, else return as-is. */
@@ -53,6 +54,7 @@ export default class IrisMailPlugin extends Plugin {
 
   async onload(): Promise<void> {
     await this.loadSettings();
+    setRelayApp(this.app);
 
     this.store = new EmailStore(this.app);
     await this.store.load();
