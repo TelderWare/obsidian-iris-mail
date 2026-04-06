@@ -111,7 +111,7 @@ async function callClaude(
       if (attempt < MAX_RETRIES && (
         lastError.message.includes("timed out") ||
         lastError.message.includes("429") ||
-        lastError.message.includes("5")
+        /\b5\d{2}\b/.test(lastError.message)
       )) {
         continue;
       }

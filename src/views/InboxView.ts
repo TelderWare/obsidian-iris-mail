@@ -2498,7 +2498,7 @@ export class InboxView extends ItemView {
     } else {
       frontmatterLines = [
         "---",
-        ...dateLine("dueDate", note.dueDate),
+        ...dateLine("closes", note.dueDate),
         "---",
       ];
       body = `- [ ] ${note.description}`;
