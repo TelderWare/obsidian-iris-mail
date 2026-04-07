@@ -1,4 +1,4 @@
-import { App, MarkdownRenderer, Menu, setIcon } from "obsidian";
+import { App, MarkdownRenderer, Menu, sanitizeHTMLToDom, setIcon } from "obsidian";
 import type { Message } from "../../types";
 import type { ImportanceClass, TagCacheEntry, DetectedItemEntry } from "../../store/types";
 import type { NameResolver, EffectiveSenderResolver } from "./MessageList";
@@ -930,17 +930,9 @@ export class MessageViewer {
       cls: "iris-viewer-html-content",
     });
 
-    // Sanitize the HTML — strip scripts, event handlers, etc.
-    const cleaned = html
-      .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "")
-      .replace(/<iframe\b[^<]*(?:(?!<\/iframe>)<[^<]*)*<\/iframe>/gi, "")
-      .replace(/<object\b[^<]*(?:(?!<\/object>)<[^<]*)*<\/object>/gi, "")
-      .replace(/<embed\b[^>]*\/?>/gi, "")
-      .replace(/<form\b[^<]*(?:(?!<\/form>)<[^<]*)*<\/form>/gi, "")
-      .replace(/on\w+\s*=\s*"[^"]*"/gi, "")
-      .replace(/on\w+\s*=\s*'[^']*'/gi, "")
-      .replace(/javascript\s*:/gi, "blocked:");
-
-    htmlContainer.innerHTML = cleaned;
+    // Sanitize untrusted email HTML via Obsidian's DOM sanitizer (allowlist-based,
+    // strips scripts/handlers/javascript: URLs). Regex-based stripping is unsafe.
+    const fragment = sanitizeHTMLToDom(html);
+    htmlContainer.appendChild(fragment);
   }
 }
