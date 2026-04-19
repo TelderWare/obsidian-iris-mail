@@ -1,6 +1,5 @@
 export interface BodyCacheEntry {
   messageId: string;
-  conversationId: string;
   subject: string;
   from: string;
   receivedDateTime: string;
@@ -17,18 +16,6 @@ export interface ProcessedCacheEntry {
   processedMarkdown: string;
   vaultPath: string;
   processedAt: number;
-}
-
-export type ImportanceClass = "important" | "routine" | "noise";
-
-export interface ClassificationCacheEntry {
-  messageId: string;
-  classification: ImportanceClass;
-  /** "manual" if user-assigned, "auto" if classifier-predicted. */
-  source: "auto" | "manual";
-  /** Importance prompt version that produced this classification (auto only). */
-  promptVersion?: number;
-  classifiedAt: number;
 }
 
 export interface NicknameCacheEntry {
@@ -70,11 +57,19 @@ export interface DetectedItemEntry {
   resolvedAt?: number;
 }
 
+export interface MessageListCacheEntry {
+  /** Raw Graph Message objects returned by the last successful list fetch. */
+  messages: unknown[];
+  nextLink: string | null;
+  cachedAt: number;
+}
+
 export interface EmailStoreIndex {
   version: 1;
   bodies: Record<string, BodyCacheEntry>;
+  /** Last successful message list per `${folderId}:${showRead ? "all" : "unread"}`. */
+  messageLists: Record<string, MessageListCacheEntry>;
   processed: Record<string, ProcessedCacheEntry>;
-  classifications: Record<string, ClassificationCacheEntry>;
   nicknames: Record<string, NicknameCacheEntry>;
   /** Message IDs marked as read → timestamp when marked. */
   readMessages: Record<string, number>;

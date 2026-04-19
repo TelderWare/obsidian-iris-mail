@@ -56,7 +56,7 @@ export default class IrisMailPlugin extends Plugin {
     await this.loadSettings();
     setRelayApp(this.app);
 
-    this.store = new EmailStore(this.app);
+    this.store = new EmailStore(this);
     await this.store.load();
 
     this.authProvider = new AuthProvider();
@@ -142,10 +142,7 @@ export default class IrisMailPlugin extends Plugin {
   }
 
   private async ensureInitialized(): Promise<boolean> {
-    if (!this.settings.clientId) {
-      new Notice("Please configure your Azure Client ID in Iris Mail settings first.");
-      return false;
-    }
+    if (!this.settings.clientId) return false;
     await this.authProvider.initialize(this.settings);
     return true;
   }
@@ -219,7 +216,9 @@ export default class IrisMailPlugin extends Plugin {
 
   async loadSettings(): Promise<void> {
     const data = await this.loadData();
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
+    // Strip the EmailStore cache blob so it doesn't leak into the settings object
+    const { __cache: _ignored, ...settingsData } = (data ?? {}) as Record<string, unknown>;
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, settingsData);
 
     // Decrypt API key from storage
     if (this.settings.anthropicApiKey) {
@@ -239,6 +238,13 @@ export default class IrisMailPlugin extends Plugin {
 
     // Enable debug logging if configured
     setDebugEnabled(!!this.settings.debugLogging);
+
+    // Drop legacy triage fields if present
+    const legacy = this.settings as unknown as Record<string, unknown>;
+    delete legacy.triageTree;
+    delete legacy.triageGraph;
+    delete legacy.triageTreeVersion;
+    delete legacy.enableTriage;
   }
 
   async saveSettings(): Promise<void> {
@@ -247,7 +253,11 @@ export default class IrisMailPlugin extends Plugin {
     if (toSave.anthropicApiKey && !toSave.anthropicApiKey.startsWith("enc:")) {
       toSave.anthropicApiKey = encryptApiKey(toSave.anthropicApiKey);
     }
-    await this.saveData(toSave);
+    // Merge into existing data so we don't clobber the EmailStore cache
+    const existing = ((await this.loadData()) ?? {}) as Record<string, unknown>;
+    const merged: Record<string, unknown> = { ...existing, ...toSave };
+    if (existing.__cache !== undefined) merged.__cache = existing.__cache;
+    await this.saveData(merged);
   }
 
   scheduleSaveSettings(): void {
@@ -302,10 +312,7 @@ export default class IrisMailPlugin extends Plugin {
     }
   }
 
-  /**
-   * Compute badge count from a set of messages using store classification data.
-   * Applies the same default filters as InboxView (unread-only + hide-noise).
-   */
+  /** Compute badge count from a set of messages. */
   private updateBadgeFromMessages(messages: Message[]): void {
     const mode = this.settings.badgeCount;
     if (mode === "off") {
@@ -313,24 +320,12 @@ export default class IrisMailPlugin extends Plugin {
       return;
     }
 
-    const classData = this.store.getAllClassificationData();
-    const nonNoise = messages.filter(
-      (m) => classData.classes.get(m.id || "") !== "noise",
-    );
-
     switch (mode) {
       case "unread":
-        this.updateBadge(nonNoise.filter((m) => !m.isRead).length);
-        break;
-      case "important":
-        this.updateBadge(
-          nonNoise.filter(
-            (m) => !m.isRead && classData.classes.get(m.id || "") === "important",
-          ).length,
-        );
+        this.updateBadge(messages.filter((m) => !m.isRead).length);
         break;
       case "total":
-        this.updateBadge(nonNoise.length);
+        this.updateBadge(messages.length);
         break;
     }
   }

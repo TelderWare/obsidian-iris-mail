@@ -15,7 +15,7 @@ export interface GraphPagedResponse<T> {
 
 // Plugin settings
 export type AuthMethod = "auth-code" | "device-code";
-export type BadgeCountMode = "off" | "unread" | "important" | "total";
+export type BadgeCountMode = "off" | "unread" | "total";
 export type BadgePosition = "top-right" | "top-left" | "bottom-right" | "bottom-left" | "off";
 
 export interface IrisMailSettings {
@@ -24,7 +24,6 @@ export interface IrisMailSettings {
   authMethod: AuthMethod;
   redirectPort: number;
   refreshIntervalMinutes: number;
-  saveFolderPath: string;
   pageSize: number;
   showReadEmails: boolean;
   /** What the ribbon badge displays. */
@@ -39,16 +38,14 @@ export interface IrisMailSettings {
   tagCategories: string;
   /** Map of tag name → Lucide icon name. */
   tagIcons: Record<string, string>;
+  /** Map of tag name → plain-English definition used for yes/no classification. */
+  tagDescriptions: Record<string, string>;
   /** Whether auto-tagging via Claude is enabled. */
   enableAutoTagging: boolean;
   /** Custom tag classification prompt (overrides default). */
   tagClassifyPrompt: string;
-  /** Current tag prompt version (incremented on each refinement). */
-  tagPromptVersion: number;
-  /** Custom importance classification prompt (overrides default). */
-  importanceClassifyPrompt: string;
-  /** Current importance prompt version (incremented on each refinement). */
-  importancePromptVersion: number;
+  /** Per-tag prompt version — incremented when the tag's definition or the meta-prompt changes. */
+  tagPromptVersions: Record<string, number>;
   /** Max messages to prefetch Claude extraction for in background. 0 = disabled, -1 = all. */
   prefetchLimit: number;
   /** Show the original sender of forwarded emails instead of the forwarder. */
@@ -62,22 +59,11 @@ export interface IrisMailSettings {
   /** Custom prompt for event/task extraction (overrides default). */
   itemDetectionPrompt: string;
   // Persisted view state
-  viewMode: "conversations" | "senders";
+  viewMode: "messages" | "senders";
   sortNewestFirst: boolean;
   filterUnreadOnly: boolean;
-  filterHideNoise: boolean;
-  filterImportantOnly: boolean;
   /** Enable debug logging to console. */
   debugLogging: boolean;
-}
-
-// Conversation grouping
-export interface ConversationGroup {
-  conversationId: string;
-  messages: Message[];
-  subject: string;
-  latestMessage: Message;
-  unreadCount: number;
 }
 
 // Sender grouping
@@ -94,10 +80,8 @@ export interface SenderGroup {
 // Internal UI state
 export interface MessageListState {
   messages: Message[];
-  conversations: ConversationGroup[];
   nextLink: string | null;
   isLoading: boolean;
-  selectedConversationId: string | null;
   searchQuery: string;
 }
 

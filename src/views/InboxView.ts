@@ -3,19 +3,22 @@ import type IrisMailPlugin from "../main";
 import {
   VIEW_TYPE_IRIS_MAIL,
   DEFAULT_CLAUDE_PROMPT,
-  IMPORTANCE_CLASSIFY_PROMPT,
   NICKNAME_PROMPT,
+  NICKNAME_BATCH_PROMPT,
   TAG_CLASSIFY_PROMPT,
-  TAG_ICON_CYCLE,
+  TAG_ICON_POOL,
   ITEM_DETECTION_PROMPT,
   parseTagCategories,
+  getTagVersion,
+  bumpTagVersion,
 } from "../constants";
 import { MessageList } from "./components/MessageList";
 import { MessageViewer } from "./components/MessageViewer";
 import { NicknameModal } from "./components/NicknameModal";
+import { CreateTagModal } from "./components/CreateTagModal";
 import { SearchBar } from "./components/SearchBar";
 import { Toolbar } from "./components/Toolbar";
-import { processEmailWithClaude, classifyEmailTags, refineTagPrompt, refineImportancePrompt, generateNickname, mergeEmailsToFormula, refineTagPromptBulk, refineImportancePromptBulk, extractNoteFromSelection, detectItemsInEmail } from "../utils/claudeApi";
+import { processEmailWithClaude, classifyEmailTagsYesNo, refineTagCriteria, generateNickname, generateNicknamesBatch, mergeEmailsToFormula, refineTagCriteriaBulk, extractNoteFromSelection, detectItemsInEmail, hasClaudeAccess, generateTagDescription, pickTagIcon, type TagCandidate } from "../utils/claudeApi";
 import type { NoteType, ExtractedNote } from "../utils/claudeApi";
 import { htmlToMarkdown } from "../utils/htmlToMarkdown";
 import { extractForwardedSender } from "../utils/extractForwardedSender";
@@ -23,11 +26,10 @@ import { getEnvelopeSender } from "../utils/envelopeSender";
 import { logger } from "../utils/logger";
 import { EmailStore } from "../store/EmailStore";
 import { EmailClassifier } from "../services/EmailClassifier";
-import type { ImportanceClass, TagCacheEntry, DetectedItemEntry } from "../store/types";
+import type { TagCacheEntry, DetectedItemEntry } from "../store/types";
 import type {
   Message,
   MessageListState,
-  ConversationGroup,
   SenderGroup,
   GraphPagedResponse,
 } from "../types";
@@ -50,19 +52,18 @@ export class InboxView extends ItemView {
   private messageViewer!: MessageViewer;
   private searchBar!: SearchBar;
   private toolbar!: Toolbar;
+  private compactResizeObserver: ResizeObserver | null = null;
 
   private inboxFolderId: string | null = null;
   private messageState: MessageListState = {
     messages: [],
-    conversations: [],
     nextLink: null,
     isLoading: false,
-    selectedConversationId: null,
     searchQuery: "",
   };
 
-  // View mode: senders (default) or conversations
-  private viewMode!: "conversations" | "senders";
+  // View mode: flat messages (default) or senders
+  private viewMode!: "messages" | "senders";
   private senderGroups: SenderGroup[] = [];
   private activeSender: SenderGroup | null = null;
   private viewModeToggleBtn!: HTMLButtonElement;
@@ -70,15 +71,8 @@ export class InboxView extends ItemView {
   private sortToggleBtn!: HTMLButtonElement;
   private filterWrap!: HTMLDivElement;
   private filterUnreadOnly!: boolean;
-  private filterHideNoise!: boolean;
-  private filterImportantOnly!: boolean;
   private unreadOptBtn!: HTMLButtonElement;
-  private noiseOptBtn!: HTMLButtonElement;
-  private importantOptBtn!: HTMLButtonElement;
 
-  // Currently drilled-into conversation
-  private activeConversation: ConversationGroup | null = null;
-  private activeConversationMessages: Message[] = [];
   private selectedMessageId: string | null = null;
   private lastStrippedHtml: string = "";
 
@@ -86,22 +80,17 @@ export class InboxView extends ItemView {
   private classifier!: EmailClassifier;
 
   // In-memory caches
-  private conversationBodyCache = new Map<string, Message[]>();
   private processedCache = new Map<string, string>();
   private nicknameCache = new Map<string, string>();
   private detectedItemsCache = new Map<string, DetectedItemEntry[]>();
 
   // Convenience accessors for classifier caches
-  private get classificationCache() { return this.classifier.classifications; }
-  private get classificationSourceCache() { return this.classifier.classificationSources; }
-  private get classificationVersionCache() { return this.classifier.classificationVersions; }
   private get tagCache() { return this.classifier.tags; }
   private tagWrap!: HTMLDivElement;
   private topBar!: HTMLDivElement;
 
   // Prefetch state
   private prefetchGeneration = 0;
-  private classifyAllPromise: Promise<void> | null = null;
   private prefetchAllPromise: Promise<void> | null = null;
   private prefetchInflight = new Set<string>();
 
@@ -113,8 +102,6 @@ export class InboxView extends ItemView {
     this.viewMode = s.viewMode;
     this.sortNewestFirst = s.sortNewestFirst;
     this.filterUnreadOnly = s.filterUnreadOnly;
-    this.filterHideNoise = s.filterHideNoise;
-    this.filterImportantOnly = s.filterImportantOnly;
   }
 
   getViewType(): string {
@@ -133,6 +120,21 @@ export class InboxView extends ItemView {
     const container = this.contentEl;
     container.empty();
     container.addClass("iris-mail-container");
+
+    // Hide the top toolbar when vertical space is at a premium.
+    const COMPACT_HEIGHT_PX = 700;
+    const updateCompact = () => {
+      container.toggleClass(
+        "iris-compact",
+        container.clientHeight > 0 && container.clientHeight < COMPACT_HEIGHT_PX,
+      );
+    };
+    if (this.compactResizeObserver) {
+      this.compactResizeObserver.disconnect();
+    }
+    this.compactResizeObserver = new ResizeObserver(() => updateCompact());
+    this.compactResizeObserver.observe(container);
+    updateCompact();
 
     if (
       !this.plugin.authProvider.isSignedIn() &&
@@ -157,15 +159,16 @@ export class InboxView extends ItemView {
 
   async onClose(): Promise<void> {
     this.prefetchGeneration++;
+    if (this.compactResizeObserver) {
+      this.compactResizeObserver.disconnect();
+      this.compactResizeObserver = null;
+    }
     this.contentEl.empty();
   }
 
   async refresh(): Promise<void> {
     this.prefetchGeneration++;
-    this.conversationBodyCache.clear();
     this.processedCache.clear();
-    this.activeConversation = null;
-    this.activeConversationMessages = [];
 
     // Re-read persistent caches without tearing down the UI
     this.reloadCaches();
@@ -197,28 +200,123 @@ export class InboxView extends ItemView {
       text: "Sign in with browser",
       cls: "mod-cta",
     });
-    browserBtn.addEventListener("click", () =>
-      this.plugin.handleLoginWithAuthCode(),
-    );
 
     const deviceBtn = btnGroup.createEl("button", {
       text: "Sign in with device code",
     });
-    deviceBtn.addEventListener("click", () =>
-      this.plugin.handleLoginWithDeviceCode(),
-    );
+
+    const startLogin = (method: "auth-code" | "device-code") => {
+      if (!this.plugin.settings.clientId) {
+        this.showClientIdEntry(prompt, btnGroup, method);
+        return;
+      }
+      if (method === "auth-code") this.plugin.handleLoginWithAuthCode();
+      else this.plugin.handleLoginWithDeviceCode();
+    };
+
+    browserBtn.addEventListener("click", () => startLogin("auth-code"));
+    deviceBtn.addEventListener("click", () => startLogin("device-code"));
+  }
+
+  private showClientIdEntry(
+    prompt: HTMLElement,
+    btnGroup: HTMLElement,
+    method: "auth-code" | "device-code",
+  ): void {
+    // Avoid stacking multiple entries on repeat clicks
+    const existing = prompt.querySelector(".iris-clientid-entry");
+    if (existing) {
+      (existing.querySelector("input") as HTMLInputElement | null)?.focus();
+      return;
+    }
+    btnGroup.hide();
+
+    const entry = prompt.createDiv({ cls: "iris-clientid-entry" });
+    entry.createEl("label", {
+      cls: "iris-clientid-label",
+      text: "Azure Application (client) ID",
+    });
+
+    const inputWrap = entry.createDiv({ cls: "iris-clientid-input-wrap" });
+    const input = inputWrap.createEl("input", {
+      cls: "iris-clientid-input",
+      attr: {
+        type: "text",
+        placeholder: "00000000-0000-0000-0000-000000000000",
+        spellcheck: "false",
+        autocomplete: "off",
+      },
+    }) as HTMLInputElement;
+
+    const error = entry.createDiv({ cls: "iris-clientid-error" });
+
+    const help = entry.createEl("a", {
+      cls: "iris-clientid-help",
+      text: "Open Azure portal →",
+      href: "https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade",
+    });
+    help.setAttr("target", "_blank");
+    help.setAttr("rel", "noopener");
+
+    const actions = entry.createDiv({ cls: "iris-clientid-actions" });
+    const cancelBtn = actions.createEl("button", { text: "Cancel" });
+    const submitBtn = actions.createEl("button", {
+      text: "Continue",
+      cls: "mod-cta",
+    });
+    submitBtn.disabled = true;
+
+    const guidRe =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+    const validate = (): boolean => {
+      const v = input.value.trim();
+      const ok = guidRe.test(v);
+      submitBtn.disabled = !ok;
+      error.setText(v.length > 0 && !ok ? "Must be a valid GUID." : "");
+      return ok;
+    };
+
+    const submit = async () => {
+      if (!validate()) return;
+      this.plugin.settings.clientId = input.value.trim();
+      await this.plugin.saveSettings();
+      entry.remove();
+      btnGroup.show();
+      if (method === "auth-code") this.plugin.handleLoginWithAuthCode();
+      else this.plugin.handleLoginWithDeviceCode();
+    };
+
+    input.addEventListener("input", validate);
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        void submit();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        entry.remove();
+        btnGroup.show();
+      }
+    });
+    cancelBtn.addEventListener("click", () => {
+      entry.remove();
+      btnGroup.show();
+    });
+    submitBtn.addEventListener("click", () => void submit());
+
+    setTimeout(() => input.focus(), 0);
   }
 
   private renderInboxUI(container: HTMLElement): void {
     // Top bar: senders toggle (left) + search & refresh (right)
     const topBar = container.createDiv({ cls: "iris-topbar" });
 
-    // Senders view toggle
+    // Senders view toggle (off = flat messages; on = grouped by sender)
     this.viewModeToggleBtn = topBar.createEl("button", {
       cls:
         "iris-topbar-btn clickable-icon" +
         (this.viewMode === "senders" ? " is-active" : ""),
-      attr: { "aria-label": "Senders view" },
+      attr: { "aria-label": "Group by sender" },
     });
     setIcon(this.viewModeToggleBtn, "users");
     this.viewModeToggleBtn.addEventListener("click", () =>
@@ -253,18 +351,6 @@ export class InboxView extends ItemView {
       this.filterWrap, "mail", "Unread only",
       () => this.filterUnreadOnly,
       () => { this.filterUnreadOnly = !this.filterUnreadOnly; },
-    );
-
-    this.noiseOptBtn = this.createFilterButton(
-      this.filterWrap, "volume-off", "Hide noise",
-      () => this.filterHideNoise,
-      () => { this.filterHideNoise = !this.filterHideNoise; },
-    );
-
-    this.importantOptBtn = this.createFilterButton(
-      this.filterWrap, "circle-alert", "Important only",
-      () => this.filterImportantOnly,
-      () => { this.filterImportantOnly = !this.filterImportantOnly; },
     );
 
     // Tag bar: existing tag icons + add button
@@ -304,8 +390,6 @@ export class InboxView extends ItemView {
 
     const listEl = rightPane.createDiv({ cls: "iris-message-list" });
     this.messageList = new MessageList(listEl, {
-      onConversationSelect: (conv: ConversationGroup) =>
-        this.handleConversationSelect(conv),
       onMessageSelect: (msg: Message) => this.handleMessageSelect(msg),
       onSenderSelect: (sender: SenderGroup) =>
         this.handleSenderSelect(sender),
@@ -314,20 +398,16 @@ export class InboxView extends ItemView {
       onMultiSelect: (ids: Set<string>) => this.handleMultiSelect(ids),
       onEditNickname: (addr: string, rawName: string) => this.openNicknameModal(addr, rawName),
     }, nameResolver, effectiveSenderResolver);
-    this.messageList.setClassifications(this.classificationCache);
 
     const viewerEl = rightPane.createDiv({ cls: "iris-message-viewer" });
     this.messageViewer = new MessageViewer(viewerEl, this.plugin.app, {
       onMarkAsRead: (msg: Message) => this.handleMarkAsRead(msg),
       onMarkAsUnread: (msg: Message) => this.handleMarkAsUnread(msg),
       onTagChange: (msg: Message, tag: string | null) => this.handleTagChange(msg, tag),
-      onImportanceChange: (msg, importance) => this.handleImportanceChange(msg, importance),
       onRetagMessage: (msg) => this.handleRetagMessage(msg),
-      onReclassifyMessage: (msg) => this.handleReclassifyMessage(msg),
       onBatchMarkAsRead: (ids) => this.handleBatchMarkAsRead(ids),
       onBatchMarkAsUnread: (ids) => this.handleBatchMarkAsUnread(ids),
       onBatchTag: (ids, tag) => this.handleBatchTag(ids, tag),
-      onBulkDenyImportance: (ids, oldClass, newClass) => this.handleBulkDenyImportance(ids, oldClass, newClass),
       onBulkDenyTag: (ids, tag) => this.handleBulkDenyTag(ids, tag),
       onCreateNoteFromSelection: (text, noteType, msg) => this.handleCreateNoteFromSelection(text, noteType, msg),
       onAcceptDetectedItem: (messageId, item) => this.handleAcceptDetectedItem(messageId, item),
@@ -336,14 +416,14 @@ export class InboxView extends ItemView {
       onReloadDetectedItems: (messageId) => this.handleReloadDetectedItems(messageId),
       onReprocessMessage: (msg) => this.handleReprocessMessage(msg),
       onEditNickname: (addr: string, rawName: string) => this.openNicknameModal(addr, rawName),
+      onDismiss: () => { this.messageViewer.clear(); },
     }, nameResolver);
     this.messageViewer.setEffectiveSenderResolver(effectiveSenderResolver);
     this.messageViewer.setTagCategories(this.getTagCategories());
     this.messageViewer.setTagIcons(this.getTagIconMap());
     this.messageViewer.setTagCache(this.tagCache);
     this.messageViewer.setPromptVersions(
-      this.plugin.settings.tagPromptVersion,
-      this.plugin.settings.importancePromptVersion,
+      this.plugin.settings.tagPromptVersions || {},
     );
   }
 
@@ -371,92 +451,67 @@ export class InboxView extends ItemView {
     return btn;
   }
 
-  /** Recompute conversation/sender groupings and update badge after any state change. */
+  /** Recompute sender groupings and update badge after any state change. */
   private regroupAndSync(): void {
-    this.messageState.conversations = this.groupByConversation(this.messageState.messages);
     this.senderGroups = this.groupByEffectiveSender(this.messageState.messages);
     this.syncBadge();
   }
 
-  /** Push the current classification cache to the message list and refresh importance indicators. */
-  private syncClassificationUI(): void {
-    this.messageList.setClassifications(this.classificationCache);
-    this.messageList.updateImportanceIndicators();
-  }
-
-  /** Re-render the viewer for the currently selected message with its classification data. */
+  /** Re-render the viewer for the currently selected message. */
   private renderSelectedMessage(msg: Message): void {
     if (!msg.id || this.selectedMessageId !== msg.id) return;
     this.messageViewer.setDetectedItems(this.detectedItemsCache.get(msg.id) || []);
-    this.messageViewer.render(
-      msg,
-      this.lastStrippedHtml,
-      this.classificationCache.get(msg.id),
-      this.classificationSourceCache.get(msg.id),
-      this.classificationVersionCache.get(msg.id),
-    );
+    this.messageViewer.render(msg, this.lastStrippedHtml);
   }
 
   /** Reset drill-down/selection state and clear viewer. */
   private clearDrillDown(): void {
-    this.activeConversation = null;
-    this.activeConversationMessages = [];
     this.activeSender = null;
     this.selectedMessageId = null;
     this.messageList.clearMultiSelection();
     this.messageViewer.clear();
   }
 
-  /** Classify a message via Claude and update all caches. */
-  private async classifyAndCacheMessage(msgId: string, content: string): Promise<ImportanceClass> {
-    const result = await this.classifier.classifyAndCache(msgId, content);
-    this.syncClassificationUI();
-    return result;
-  }
-
   /** Batch mark messages as read or unread. */
   private handleBatchReadState(ids: Set<string>, markAsRead: boolean): void {
     const changed: string[] = [];
-
-    if (!this.activeConversation && !this.activeSender) {
-      for (const conv of this.messageState.conversations) {
-        if (ids.has(conv.conversationId)) {
-          for (const msg of conv.messages) {
-            if (msg.id && msg.isRead !== markAsRead) {
-              msg.isRead = markAsRead;
-              if (markAsRead) this.plugin.store.markRead(msg.id);
-              else this.plugin.store.markUnread(msg.id);
-              changed.push(msg.id);
-            }
-          }
-        }
-      }
-    } else {
-      const allMessages = [
-        ...this.messageState.messages,
-        ...this.activeConversationMessages,
-      ];
-      for (const msg of allMessages) {
-        if (msg.id && ids.has(msg.id) && msg.isRead !== markAsRead) {
-          msg.isRead = markAsRead;
-          if (markAsRead) this.plugin.store.markRead(msg.id);
-          else this.plugin.store.markUnread(msg.id);
-          changed.push(msg.id);
-        }
+    for (const msg of this.messageState.messages) {
+      if (msg.id && ids.has(msg.id) && msg.isRead !== markAsRead) {
+        msg.isRead = markAsRead;
+        if (markAsRead) this.plugin.store.markRead(msg.id);
+        else this.plugin.store.markUnread(msg.id);
+        changed.push(msg.id);
       }
     }
 
-    // Sync to Graph API in background
+    // Sync to Graph API in background, rolling back any that fail.
     const api = this.plugin.mailApi;
     for (const id of changed) {
       const call = markAsRead ? api.markAsRead(id) : api.markAsUnread(id);
-      void call.catch((err) => logger.warn("InboxView", "Failed to sync read state", err));
+      void call.catch((err) => this.rollbackReadState(id, !markAsRead, err));
     }
 
     this.regroupAndSync();
     this.messageList.clearMultiSelection();
     this.messageViewer.clear();
     this.renderCurrentView();
+  }
+
+  /**
+   * Revert an optimistic read-state change when the Graph API sync fails, so
+   * the local view stays consistent with the server. `prevIsRead` is the
+   * state to restore (i.e. what it was before the failed update).
+   */
+  private rollbackReadState(id: string, prevIsRead: boolean, err: unknown): void {
+    logger.warn("InboxView", "Failed to sync read state", err);
+    const canonical = this.messageState.messages.find((m) => m.id === id);
+    if (canonical) canonical.isRead = prevIsRead;
+    if (prevIsRead) this.plugin.store.markRead(id);
+    else this.plugin.store.markUnread(id);
+    this.regroupAndSync();
+    this.renderCurrentView();
+    const action = prevIsRead ? "unread" : "read";
+    new Notice(`Couldn't mark as ${action} on server — reverted.`);
   }
 
   // --- Private: event handlers ---
@@ -509,21 +564,25 @@ export class InboxView extends ItemView {
     this.messageState.isLoading = true;
     this.messageList.showLoading();
 
+    const showRead = this.plugin.settings.showReadEmails;
+    const searchQuery = this.messageState.searchQuery || undefined;
     try {
-      const filter =
-        !this.plugin.settings.showReadEmails ? "isRead eq false" : undefined;
+      const filter = !showRead ? "isRead eq false" : undefined;
 
       const response: GraphPagedResponse<Message> =
         await this.plugin.mailApi.listMessages(folderId, {
           top: this.plugin.settings.pageSize,
-          search: this.messageState.searchQuery || undefined,
+          search: searchQuery,
           filter,
         });
 
       this.messageState.messages = response.value;
       this.plugin.store.applyReadState(this.messageState.messages);
       this.messageState.nextLink = response["@odata.nextLink"] || null;
-      this.messageState.selectedConversationId = null;
+      // Cache non-search list results so we can fall back on next failure.
+      if (!searchQuery) {
+        this.plugin.store.setMessageList(folderId, showRead, response.value, this.messageState.nextLink);
+      }
       this.regroupAndSync();
       this.renderCurrentView();
       this.startBackgroundProcessing();
@@ -531,89 +590,26 @@ export class InboxView extends ItemView {
       if (!this.plugin.authProvider.isSignedIn()) {
         this.renderCurrentView();
       } else {
-        const msg = err instanceof Error ? err.message : String(err);
-        new Notice(`Failed to load messages: ${msg}`);
+        // Fall back to cached list if available (non-search queries only).
+        const cached = !searchQuery
+          ? this.plugin.store.getMessageList(folderId, showRead)
+          : undefined;
+        if (cached) {
+          this.messageState.messages = cached.messages as Message[];
+          this.plugin.store.applyReadState(this.messageState.messages);
+          this.messageState.nextLink = cached.nextLink;
+          this.regroupAndSync();
+          this.renderCurrentView();
+          const errMsg = err instanceof Error ? err.message : String(err);
+          new Notice(`Offline — showing cached messages (${errMsg})`);
+        } else {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          new Notice(`Failed to load messages: ${errMsg}`);
+        }
       }
     } finally {
       this.messageState.isLoading = false;
     }
-  }
-
-  private async handleConversationSelect(
-    conv: ConversationGroup,
-  ): Promise<void> {
-    if (!conv.conversationId) {
-      new Notice("Cannot open conversation: missing conversation ID.");
-      return;
-    }
-    this.messageState.selectedConversationId = conv.conversationId;
-    this.activeConversation = conv;
-
-    let fullMessages: Message[];
-    try {
-      fullMessages = await this.fetchConversationBodies(conv);
-    } catch (err: unknown) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      new Notice(`Failed to load conversation: ${errMsg}`);
-      return;
-    }
-
-    this.activeConversationMessages = fullMessages;
-
-    // For single-message conversations, skip the drill-down
-    if (conv.messages.length === 1) {
-      const msg = fullMessages[fullMessages.length - 1];
-      await this.showMessageInViewer(msg);
-      return;
-    }
-
-    // Multi-message: drill into message list
-    this.messageViewer.clear();
-    this.messageList.renderConversationMessages(conv.subject, fullMessages);
-
-    // Auto-select the latest message
-    const latest = fullMessages[fullMessages.length - 1];
-    await this.showMessageInViewer(latest);
-  }
-
-  /** Fetch conversation bodies with L1 (memory) → L2 (disk) → Graph fallback. */
-  private async fetchConversationBodies(
-    conv: ConversationGroup,
-  ): Promise<Message[]> {
-    const convId = conv.conversationId;
-
-    // L1: in-memory cache
-    const l1 = this.conversationBodyCache.get(convId);
-    if (l1) return l1;
-
-    const cache = this.plugin.store;
-    const messageIds = conv.messages.map((m) => m.id!).filter(Boolean);
-
-    // L2: disk cache — check if all message bodies are cached
-    if (messageIds.length > 0 && cache.hasFullConversation(messageIds)) {
-      const messages = conv.messages.map((m) => {
-        const entry = cache.getBody(m.id!)!;
-        return {
-          ...m,
-          body: { content: entry.bodyHtml, contentType: "html" as const },
-        };
-      });
-      this.conversationBodyCache.set(convId, messages);
-      return messages;
-    }
-
-    // L3: Graph API fetch
-    const messages = await this.plugin.mailApi.getConversationMessages(convId);
-
-    // Backfill disk cache
-    for (const msg of messages) {
-      if (msg.body?.content && msg.id && !cache.hasBody(msg.id)) {
-        cache.setBody(msg, msg.body.content);
-      }
-    }
-
-    this.conversationBodyCache.set(convId, messages);
-    return messages;
   }
 
   private handleMessageSelect(msg: Message): void {
@@ -629,36 +625,64 @@ export class InboxView extends ItemView {
       if (canonical && canonical !== msg) canonical.isRead = true;
 
       this.plugin.store.markRead(msg.id);
-      void this.plugin.mailApi.markAsRead(msg.id).catch((err) =>
-        logger.warn("InboxView", "Failed to sync read state", err));
+      const id = msg.id;
+      void this.plugin.mailApi.markAsRead(id).catch((err) =>
+        this.rollbackReadState(id, false, err));
     }
 
     this.regroupAndSync();
 
-    // In sender view, stay on the same person's message list
+    // Auto-advance to next unread. The list re-render animates the disappearing row.
+    const next = this.findNextUnread(msg.id || null);
+    this.renderCurrentView();
+    if (next) {
+      void this.showMessageInViewer(next);
+      return;
+    }
+
+    // Nothing unread left; if we were in a sender drill-down that's now empty,
+    // fall back to the top-level list.
     if (this.activeSender) {
       const updated = this.senderGroups.find(
         (s) => s.groupKey === this.activeSender!.groupKey,
       );
-      if (updated) {
-        this.activeSender = updated;
-        this.selectedMessageId = null;
-        this.messageViewer.clear();
-        const displayName = this.resolveName(
-          updated.address,
-          updated.name || updated.address,
-        );
-        const msgs = this.filterSenderMessages(updated.messages);
-        if (msgs.length > 0) {
-          this.messageList.renderConversationMessages(displayName, msgs, true);
-          return;
-        }
-        // No messages left after filtering — go back to top-level
+      const remaining = updated
+        ? this.filterSenderMessages(updated.messages)
+        : [];
+      if (remaining.length === 0) {
+        this.handleBack();
+        return;
       }
+      this.selectedMessageId = null;
+      this.messageViewer.clear();
     }
+  }
 
-    // Otherwise go back to the top-level list
-    this.handleBack();
+  /**
+   * Find the next unread message in the current view (sender drill-down or
+   * top-level flat messages list), in the active sort order.
+   */
+  private findNextUnread(currentId: string | null): Message | null {
+    const dir = this.sortNewestFirst ? -1 : 1;
+    let src: Message[];
+    if (this.activeSender) {
+      const updated = this.senderGroups.find(
+        (s) => s.groupKey === this.activeSender!.groupKey,
+      );
+      src = updated?.messages || this.activeSender.messages;
+    } else {
+      src = this.messageState.messages;
+    }
+    const list = [...src].sort(
+      (a, b) =>
+        dir *
+        (new Date(a.receivedDateTime || 0).getTime() -
+          new Date(b.receivedDateTime || 0).getTime()),
+    );
+    for (const m of list) {
+      if (!m.isRead && m.id !== currentId) return m;
+    }
+    return null;
   }
 
   private handleMarkAsUnread(msg: Message): void {
@@ -669,8 +693,9 @@ export class InboxView extends ItemView {
       if (canonical && canonical !== msg) canonical.isRead = false;
 
       this.plugin.store.markUnread(msg.id);
-      void this.plugin.mailApi.markAsUnread(msg.id).catch((err) =>
-        logger.warn("InboxView", "Failed to sync unread state", err));
+      const id = msg.id;
+      void this.plugin.mailApi.markAsUnread(id).catch((err) =>
+        this.rollbackReadState(id, true, err));
     }
 
     this.regroupAndSync();
@@ -713,63 +738,10 @@ export class InboxView extends ItemView {
     this.messageViewer.clear();
   }
 
-  /** Bulk deny importance: merge emails into formula via Haiku, then refine prompt via Opus. */
-  private async handleBulkDenyImportance(
-    ids: Set<string>,
-    oldClassification: ImportanceClass,
-    newClassification: ImportanceClass,
-  ): Promise<void> {
-    const s = this.plugin.settings;
-    if (!s.anthropicApiKey) return;
-
-    const msgIds = this.resolveBatchMessageIds(ids);
-    const contents: string[] = [];
-
-    // Apply the corrected classification to each message immediately
-    for (const msgId of msgIds) {
-      this.classificationCache.set(msgId, newClassification);
-      this.classificationSourceCache.set(msgId, "manual");
-      this.classificationVersionCache.delete(msgId);
-      this.plugin.store.setClassification(msgId, newClassification, "manual");
-
-      const msg = this.messageState.messages.find((m) => m.id === msgId);
-      if (msg) {
-        const content = this.getClassifiableContent(msg);
-        if (content) contents.push(content);
-      }
-    }
-
-    this.syncClassificationUI();
-    this.messageList.clearMultiSelection();
-    this.messageViewer.clear();
-    this.renderCurrentView();
-    this.syncBadge();
-
-    if (contents.length === 0) return;
-
-    // Merge → refine in background
-    try {
-      new Notice(`Merging ${contents.length} emails into formula…`);
-      const formula = await mergeEmailsToFormula(s.anthropicApiKey, contents);
-
-      const refined = await refineImportancePromptBulk(
-        s.anthropicApiKey,
-        this.getEffectiveImportancePrompt(),
-        formula,
-        oldClassification,
-        newClassification,
-      );
-      await this.applyRefinedPrompt("importance", refined, "Importance prompt bulk-corrected by Opus");
-    } catch (err) {
-      logger.warn("InboxView", "Bulk importance prompt refinement failed", err);
-      new Notice("Bulk importance refinement failed — classifications still applied.");
-    }
-  }
-
   /** Bulk deny tag: remove tag from all selected, merge into formula, refine prompt. */
   private async handleBulkDenyTag(ids: Set<string>, tag: string): Promise<void> {
     const s = this.plugin.settings;
-    if (!s.anthropicApiKey) return;
+    if (!hasClaudeAccess(s.anthropicApiKey)) return;
 
     const msgIds = this.resolveBatchMessageIds(ids);
     const contents: string[] = [];
@@ -803,35 +775,22 @@ export class InboxView extends ItemView {
       new Notice(`Merging ${contents.length} emails into formula…`);
       const formula = await mergeEmailsToFormula(s.anthropicApiKey, contents);
 
-      const refined = await refineTagPromptBulk(
+      const refined = await refineTagCriteriaBulk(
         s.anthropicApiKey,
-        this.getEffectiveTagPrompt(),
-        formula,
         tag,
+        s.tagDescriptions?.[tag] || "",
+        formula,
         "incorrect",
       );
-      await this.applyRefinedPrompt("tag", refined, "Tag prompt bulk-corrected by Opus");
+      this.applyRefinedTagCriteria(tag, refined, `Criteria for "${tag}" changed from ${contents.length} emails`);
     } catch (err) {
-      logger.warn("InboxView", "Bulk tag prompt refinement failed", err);
-      new Notice("Bulk tag refinement failed — tags still removed.");
+      logger.warn("InboxView", "Bulk criteria refinement failed", err);
+      new Notice("Bulk refinement failed — tags still removed.");
     }
   }
 
-  /** Expand batch IDs to message IDs (conversation IDs → their messages). */
+  /** Batch IDs are always message IDs now that the top-level list is flat. */
   private resolveBatchMessageIds(ids: Set<string>): string[] {
-    if (!this.activeConversation && !this.activeSender) {
-      // Top-level: IDs are conversationIds
-      const msgIds: string[] = [];
-      for (const conv of this.messageState.conversations) {
-        if (ids.has(conv.conversationId)) {
-          for (const msg of conv.messages) {
-            if (msg.id) msgIds.push(msg.id);
-          }
-        }
-      }
-      return msgIds;
-    }
-    // Drill-down: IDs are message IDs
     return [...ids];
   }
 
@@ -842,6 +801,7 @@ export class InboxView extends ItemView {
 
   private async showMessageInViewer(msg: Message): Promise<void> {
     this.selectedMessageId = msg.id || null;
+    this.messageList.setSelectedMessageId(msg.id || null);
     const cache = this.plugin.store;
 
     // Snapshot effective sender before body resolution so we can detect changes
@@ -896,11 +856,8 @@ export class InboxView extends ItemView {
     if (this.selectedMessageId !== (msg.id || null)) return;
 
     this.lastStrippedHtml = stripped;
-    const msgClass = msg.id ? this.classificationCache.get(msg.id) : undefined;
-    const msgClassSource = msg.id ? this.classificationSourceCache.get(msg.id) : undefined;
-    const msgClassVer = msg.id ? this.classificationVersionCache.get(msg.id) : undefined;
     this.messageViewer.setDetectedItems(this.detectedItemsCache.get(msg.id!) || []);
-    this.messageViewer.render(msg, stripped, msgClass, msgClassSource, msgClassVer);
+    this.messageViewer.render(msg, stripped);
 
     // On-demand item detection: run if never scanned, OR if previously
     // scanned with 0 results (earlier scan may have had empty content).
@@ -955,8 +912,8 @@ export class InboxView extends ItemView {
 
     // L3: Claude API processing
     if (!s.enableClaudeProcessing) return;
-    if (!s.anthropicApiKey) {
-      logger.warn("InboxView", "Claude processing enabled but no API key set");
+    if (!hasClaudeAccess(s.anthropicApiKey)) {
+      logger.warn("InboxView", "Claude processing enabled but no API key set and no iris-router relay available");
       return;
     }
     if (!stripped) return;
@@ -966,22 +923,7 @@ export class InboxView extends ItemView {
 
     this.messageViewer.showProcessingIndicator();
 
-    // Classify importance first (skip full processing for noise)
-    let classification = this.classificationCache.get(msgId);
-    if (!classification) {
-      try {
-        classification = await this.classifyAndCacheMessage(msgId, parsedBody);
-      } catch (err) {
-        logger.warn("InboxView", "Classification failed, proceeding anyway", err);
-        classification = "routine";
-      }
-    }
-
     if (this.selectedMessageId !== msgId) return;
-
-    if (classification === "noise") {
-      return;
-    }
 
     // Prepend email context (subject, sender, date) so Claude has full context
     // even when the body is sparse (e.g. meeting invitations, calendar events).
@@ -989,20 +931,12 @@ export class InboxView extends ItemView {
 
     processEmailWithClaude(s.anthropicApiKey, s.claudeModel, effectivePrompt, parsedContent)
       .then(async (markdown) => {
-        // Store raw markdown in memory (no frontmatter — viewer renders it)
+        // Store raw markdown in memory
         this.processedCache.set(msgId, markdown);
 
-        // Persist to disk with frontmatter for the vault file
-        const withFrontmatter = this.prependFrontmatter(msg, markdown);
+        // Persist to data.json
         try {
-          await cache.setProcessed(
-            msgId,
-            markdown,
-            withFrontmatter,
-            promptHash,
-            s.saveFolderPath,
-            msg,
-          );
+          await cache.setProcessed(msgId, markdown, promptHash);
         } catch (err) {
           logger.warn("InboxView", "Failed to save processed email", err);
         }
@@ -1029,8 +963,6 @@ export class InboxView extends ItemView {
 
   private async handleSearch(query: string): Promise<void> {
     this.messageState.searchQuery = query;
-    this.activeConversation = null;
-    this.activeConversationMessages = [];
     if (!this.inboxFolderId) return;
     await this.loadMessages(this.inboxFolderId);
   }
@@ -1050,6 +982,7 @@ export class InboxView extends ItemView {
         ...response.value,
       ];
       this.messageState.nextLink = response["@odata.nextLink"] || null;
+
       this.regroupAndSync();
       this.renderCurrentView();
       this.startBackgroundProcessing();
@@ -1077,23 +1010,11 @@ export class InboxView extends ItemView {
     const menu = new Menu();
     menu.addItem((item) =>
       item
-        .setTitle("Reset importance prompt")
-        .setIcon("signal")
-        .onClick(() => {
-          this.plugin.settings.importanceClassifyPrompt = "";
-          this.plugin.settings.importancePromptVersion++;
-          void this.plugin.saveSettings();
-          this.syncPromptVersions();
-          new Notice("Importance prompt reset to default");
-        }),
-    );
-    menu.addItem((item) =>
-      item
         .setTitle("Reset tagging prompt")
         .setIcon("tags")
         .onClick(() => {
           this.plugin.settings.tagClassifyPrompt = "";
-          this.plugin.settings.tagPromptVersion++;
+          this.bumpAllTagVersions();
           void this.plugin.saveSettings();
           this.syncPromptVersions();
           new Notice("Tagging prompt reset to default");
@@ -1103,15 +1024,6 @@ export class InboxView extends ItemView {
   }
 
   // --- Private: view mode ---
-
-  private handleReclassify(): void {
-    this.classifier.clearAutoClassifications();
-    this.classifier.clearAutoTags();
-    this.messageList.setClassifications(this.classificationCache);
-    this.messageViewer.setTagCache(this.tagCache);
-    this.renderCurrentView();
-    this.startBackgroundProcessing();
-  }
 
   private applyFilters(): void {
     this.clearDrillDown();
@@ -1124,14 +1036,11 @@ export class InboxView extends ItemView {
     s.viewMode = this.viewMode;
     s.sortNewestFirst = this.sortNewestFirst;
     s.filterUnreadOnly = this.filterUnreadOnly;
-    s.filterHideNoise = this.filterHideNoise;
-    s.filterImportantOnly = this.filterImportantOnly;
     void this.plugin.saveSettings();
   }
 
   private handleViewModeToggle(): void {
-    this.viewMode =
-      this.viewMode === "conversations" ? "senders" : "conversations";
+    this.viewMode = this.viewMode === "messages" ? "senders" : "messages";
     this.viewModeToggleBtn.toggleClass("is-active", this.viewMode === "senders");
     this.clearDrillDown();
     this.renderCurrentView();
@@ -1159,95 +1068,70 @@ export class InboxView extends ItemView {
           updated.name || updated.address,
         );
         const msgs = this.filterSenderMessages(updated.messages);
-        this.messageList.renderConversationMessages(displayName, msgs, true);
+        void this.messageList.renderSenderMessages(displayName, msgs);
         return;
       }
     }
 
-    // If we're drilled into a conversation, re-render with current sort
-    if (this.activeConversation && this.activeConversationMessages.length > 1) {
-      const dir = this.sortNewestFirst ? -1 : 1;
-      const sorted = [...this.activeConversationMessages].sort(
-        (a, b) =>
-          dir *
-          (new Date(a.receivedDateTime || 0).getTime() -
-            new Date(b.receivedDateTime || 0).getTime()),
-      );
-      this.messageList.renderConversationMessages(
-        this.activeConversation.subject,
-        sorted,
-      );
-      return;
-    }
-
     const hasMore = !!this.messageState.nextLink;
 
-    // Build a message-level filter from active toggles
-    const passesFilter = (m: Message) => {
-      const filtered = this.applyMessageFilters([m]);
-      return filtered.length > 0;
-    };
-    const hasFilters = this.filterUnreadOnly || this.filterImportantOnly || this.filterHideNoise;
-
-    if (hasFilters) {
-      if (this.viewMode === "senders") {
+    if (this.viewMode === "senders") {
+      const passesFilter = (m: Message) => {
+        const filtered = this.applyMessageFilters([m]);
+        return filtered.length > 0;
+      };
+      if (this.filterUnreadOnly) {
         const filtered = this.senderGroups.filter((s) =>
           s.messages.some(passesFilter),
         );
-        this.messageList.renderSenders(filtered, hasMore, passesFilter);
+        void this.messageList.renderSenders(filtered, hasMore, passesFilter);
       } else {
-        const filtered = this.messageState.conversations.filter((c) =>
-          c.messages.some(passesFilter),
-        );
-        this.messageList.renderConversations(filtered, hasMore);
+        void this.messageList.renderSenders(this.senderGroups, hasMore);
       }
-    } else if (this.viewMode === "senders") {
-      this.messageList.renderSenders(this.senderGroups, hasMore);
-    } else {
-      this.messageList.renderConversations(
-        this.messageState.conversations,
-        hasMore,
-      );
+      return;
     }
+
+    // Flat messages mode: apply filters and sort.
+    const filtered = this.applyMessageFilters(this.messageState.messages);
+    const dir = this.sortNewestFirst ? -1 : 1;
+    const sorted = [...filtered].sort(
+      (a, b) =>
+        dir *
+        (new Date(a.receivedDateTime || 0).getTime() -
+          new Date(b.receivedDateTime || 0).getTime()),
+    );
+    void this.messageList.renderFlatMessages(sorted, hasMore);
   }
 
   /**
-   * Kick off all background AI processing (classification, tagging, prefetch, detection).
+   * Kick off all background AI processing (tagging, prefetch, detection).
    * Handles errors with user-facing notices instead of swallowing rejections.
    */
   private startBackgroundProcessing(): void {
-    this.classifyAllPromise = this.classifier.classifyAllMessages(
-      this.messageState.messages,
-      () => this.syncClassificationUI(),
-    ).then(() => {
-      // Re-render if filters depend on classification
-      if (this.filterUnreadOnly || this.filterHideNoise || this.filterImportantOnly) {
-        this.renderCurrentView();
-      }
-    }).catch((err) => {
-      logger.warn("InboxView", "Background classification failed", err);
-    });
-
     void this.generateAllNicknames();
-
-    // Tag after classification finishes
-    this.classifyAllPromise.then(() => {
-      void this.classifier.autoTagAllMessages(
-        this.messageState.messages,
-        () => this.messageViewer.setTagCache(this.tagCache),
-      ).catch((err) => logger.warn("InboxView", "Auto-tagging failed", err));
-    });
 
     this.prefetchAllPromise = this.prefetchAllProcessed();
     this.prefetchAllPromise.catch((err) =>
       logger.warn("InboxView", "Background prefetch failed", err),
     );
 
+    // Tag after prefetch so the tagger sees processed markdown
+    // for every message within the prefetch window.
+    (async () => {
+      if (this.prefetchAllPromise) {
+        try { await this.prefetchAllPromise; } catch { /* proceed anyway */ }
+      }
+      await this.classifier.autoTagAllMessages(
+        this.messageState.messages,
+        () => this.messageViewer.setTagCache(this.tagCache),
+      );
+    })().catch((err) => logger.warn("InboxView", "Auto-tagging failed", err));
+
     // When Claude processing is disabled but forwarded-sender resolution is
     // on, bodies are never prefetched by prefetchAllProcessed().  Fetch them
     // here so originalSender gets extracted and the sender list updates.
     const s = this.plugin.settings;
-    if (s.resolveForwardedSender && (!s.enableClaudeProcessing || !s.anthropicApiKey)) {
+    if (s.resolveForwardedSender && (!s.enableClaudeProcessing || !hasClaudeAccess(s.anthropicApiKey))) {
       void this.prefetchBodiesForSenderResolution();
     }
 
@@ -1263,6 +1147,17 @@ export class InboxView extends ItemView {
   /** Open a modal to edit the nickname for an email address. */
   private openNicknameModal(address: string, rawName: string): void {
     const current = this.nicknameCache.get(address.toLowerCase()) || "";
+    const s = this.plugin.settings;
+    const canRegenerate = !!(s.enableClaudeProcessing && hasClaudeAccess(s.anthropicApiKey));
+    const regenerate = canRegenerate
+      ? async () => generateNickname(
+          s.anthropicApiKey,
+          s.claudeModel,
+          NICKNAME_PROMPT,
+          rawName,
+          address,
+        )
+      : undefined;
     new NicknameModal(
       this.plugin.app,
       address,
@@ -1289,6 +1184,7 @@ export class InboxView extends ItemView {
         this.renderCurrentView();
         this.messageViewer.refresh();
       },
+      regenerate,
     ).open();
   }
 
@@ -1339,7 +1235,7 @@ export class InboxView extends ItemView {
   /** Generate nicknames for all unique senders that don't have one yet. */
   private async generateAllNicknames(): Promise<void> {
     const s = this.plugin.settings;
-    if (!s.enableClaudeProcessing || !s.anthropicApiKey) return;
+    if (!s.enableClaudeProcessing || !hasClaudeAccess(s.anthropicApiKey)) return;
 
     // Collect unique effective-sender addresses + raw names
     const seen = new Map<string, string>();
@@ -1365,23 +1261,40 @@ export class InboxView extends ItemView {
 
     if (seen.size === 0) return;
 
-    for (const [addr, rawName] of seen) {
-      try {
-        const nickname = await generateNickname(
-          s.anthropicApiKey,
-          s.claudeModel,
-          NICKNAME_PROMPT,
-          rawName,
-        );
-        // Re-check after the async gap -- the user may have deleted
-        // or manually set a nickname while generation was in-flight.
-        if (this.nicknameCache.has(addr) || this.plugin.store.isNicknameDeleted(addr)) continue;
-        this.nicknameCache.set(addr, nickname);
-        this.plugin.store.setNickname(addr, nickname);
-      } catch (err) {
-        logger.warn("InboxView", "Nickname generation failed", err);
-      }
+    const entries = Array.from(seen, ([address, rawName]) => ({ address, rawName }));
+    const BATCH_SIZE = 10;
+    const CONCURRENCY = 3;
+    const batches: { address: string; rawName: string }[][] = [];
+    for (let i = 0; i < entries.length; i += BATCH_SIZE) {
+      batches.push(entries.slice(i, i + BATCH_SIZE));
     }
+
+    let next = 0;
+    const workers = Array.from({ length: Math.min(CONCURRENCY, batches.length) }, async () => {
+      while (next < batches.length) {
+        const batch = batches[next++];
+        try {
+          const map = await generateNicknamesBatch(
+            s.anthropicApiKey,
+            s.claudeModel,
+            NICKNAME_BATCH_PROMPT,
+            batch,
+          );
+          for (const e of batch) {
+            const nickname = map.get(e.address.toLowerCase());
+            if (!nickname) continue;
+            // Re-check after the async gap -- the user may have deleted
+            // or manually set a nickname while generation was in-flight.
+            if (this.nicknameCache.has(e.address) || this.plugin.store.isNicknameDeleted(e.address)) continue;
+            this.nicknameCache.set(e.address, nickname);
+            this.plugin.store.setNickname(e.address, nickname);
+          }
+        } catch (err) {
+          logger.warn("InboxView", "Nickname batch failed", err);
+        }
+      }
+    });
+    await Promise.all(workers);
 
     // Re-render to show nicknames
     this.regroupAndSync();
@@ -1396,7 +1309,7 @@ export class InboxView extends ItemView {
       sender.name || sender.address,
     );
     const msgs = this.filterSenderMessages(sender.messages);
-    this.messageList.renderConversationMessages(displayName, msgs, true);
+    void this.messageList.renderSenderMessages(displayName, msgs);
 
     // Auto-select the latest message
     if (msgs.length > 0) {
@@ -1404,21 +1317,11 @@ export class InboxView extends ItemView {
     }
   }
 
-  /** Apply active toggle filters (unread, important, hide-noise) to a message list. */
+  /** Apply active toggle filters (unread) to a message list. */
   private applyMessageFilters(messages: Message[]): Message[] {
     let filtered = messages;
     if (this.filterUnreadOnly) {
       filtered = filtered.filter((m) => !m.isRead);
-    }
-    if (this.filterImportantOnly) {
-      filtered = filtered.filter(
-        (m) => this.classificationCache.get(m.id || "") === "important",
-      );
-    }
-    if (this.filterHideNoise) {
-      filtered = filtered.filter(
-        (m) => this.classificationCache.get(m.id || "") !== "noise",
-      );
     }
     return filtered;
   }
@@ -1442,7 +1345,6 @@ export class InboxView extends ItemView {
     if (!this.selectedMessageId) return null;
     return (
       this.messageState.messages.find((m) => m.id === this.selectedMessageId) ||
-      this.activeConversationMessages.find((m) => m.id === this.selectedMessageId) ||
       null
     );
   }
@@ -1475,13 +1377,7 @@ export class InboxView extends ItemView {
       });
       btn.addEventListener("contextmenu", (e) => {
         e.preventDefault();
-        const current = this.plugin.settings.tagIcons[cat] || "tag";
-        const idx = TAG_ICON_CYCLE.indexOf(current);
-        this.plugin.settings.tagIcons[cat] =
-          TAG_ICON_CYCLE[(idx + 1) % TAG_ICON_CYCLE.length];
-        void this.plugin.saveSettings();
-        this.messageViewer.setTagIcons(this.getTagIconMap());
-        this.rebuildTagWrap();
+        this.openTagEditModal(cat);
       });
     }
 
@@ -1494,65 +1390,100 @@ export class InboxView extends ItemView {
     addBtn.addEventListener("click", () =>
       this.showAddTagInput(this.tagWrap),
     );
-
-    // Update expanded width: lead (28) + (categories + plus) * 28
-    const expandedCount = categories.length + 1; // tag icons + plus
-    this.tagWrap.style.setProperty("--tag-expanded-width", `${28 + expandedCount * 28}px`);
   }
 
-  private showAddTagInput(anchor: HTMLElement): void {
-    // Remove any existing input from the topbar
-    anchor.parentElement?.querySelector(".iris-add-tag-input")?.remove();
+  private showAddTagInput(_anchor: HTMLElement): void {
+    const s = this.plugin.settings;
+    const categories = this.getTagCategories();
+    const canGenerate = s.enableClaudeProcessing && hasClaudeAccess(s.anthropicApiKey);
 
-    const input = createEl("input", {
-      cls: "iris-add-tag-input",
-      attr: { type: "text", placeholder: "New tag…" },
-    });
-    anchor.after(input);
-    input.focus();
+    new CreateTagModal(this.plugin.app, {
+      existingTags: categories,
+      onGenerate: canGenerate
+        ? (name) => generateTagDescription(
+            s.anthropicApiKey,
+            s.claudeModel,
+            name,
+            this.getTagCandidates(),
+          )
+        : undefined,
+      onSubmit: async (name, criteria, icon, iconExplicit) => {
+        const updated = [...categories, name];
+        this.plugin.settings.tagCategories = updated.join(", ");
+        if (!this.plugin.settings.tagIcons) this.plugin.settings.tagIcons = {};
+        if (!this.plugin.settings.tagDescriptions) this.plugin.settings.tagDescriptions = {};
+        this.plugin.settings.tagDescriptions[name] = criteria;
 
-    const commit = () => {
-      const value = input.value.trim();
-      input.remove();
-      if (!value) return;
+        const usedIcons = Object.values(this.plugin.settings.tagIcons);
+        this.plugin.settings.tagIcons[name] = icon;
+        void this.plugin.saveSettings();
+        this.messageViewer.setTagCategories(updated);
+        this.messageViewer.setTagIcons(this.getTagIconMap());
+        this.rebuildTagWrap();
 
-      // Append to existing categories
-      const existing = this.plugin.settings.tagCategories;
-      const categories = existing
-        ? existing.split(",").map((s) => s.trim()).filter(Boolean)
-        : [];
-      if (categories.includes(value)) return; // already exists
-      categories.push(value);
-      this.plugin.settings.tagCategories = categories.join(", ");
+        if (!iconExplicit && canGenerate) {
+          try {
+            const picked = await pickTagIcon(
+              s.anthropicApiKey, s.claudeModel, name, criteria,
+              TAG_ICON_POOL, usedIcons,
+            );
+            if (picked) {
+              this.plugin.settings.tagIcons[name] = picked;
+              void this.plugin.saveSettings();
+              this.messageViewer.setTagIcons(this.getTagIconMap());
+              this.rebuildTagWrap();
+            }
+          } catch (err) {
+            logger.warn("InboxView", "AI icon pick failed; kept fallback", err);
+          }
+        }
+      },
+    }).open();
+  }
 
-      // Auto-assign icon from cycle
-      if (!this.plugin.settings.tagIcons) this.plugin.settings.tagIcons = {};
-      if (!this.plugin.settings.tagIcons[value]) {
-        const usedIcons = new Set(Object.values(this.plugin.settings.tagIcons));
-        const nextIcon = TAG_ICON_CYCLE.find((i) => !usedIcons.has(i)) || TAG_ICON_CYCLE[categories.length % TAG_ICON_CYCLE.length];
-        this.plugin.settings.tagIcons[value] = nextIcon;
-      }
-      void this.plugin.saveSettings();
-
-      // Update runtime state
-      this.messageViewer.setTagCategories(categories);
-      this.messageViewer.setTagIcons(this.getTagIconMap());
-      this.rebuildTagWrap();
-    };
-
-    input.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        commit();
-      } else if (e.key === "Escape") {
-        input.remove();
-      }
-    });
-    input.addEventListener("blur", () => commit());
+  private openTagEditModal(cat: string): void {
+    const s = this.plugin.settings;
+    const canGenerate = s.enableClaudeProcessing && hasClaudeAccess(s.anthropicApiKey);
+    new CreateTagModal(this.plugin.app, {
+      existingTags: this.getTagCategories(),
+      initial: {
+        name: cat,
+        criteria: s.tagDescriptions?.[cat] || "",
+        icon: s.tagIcons?.[cat] || "tag",
+      },
+      onGenerate: canGenerate
+        ? (name) => generateTagDescription(
+            s.anthropicApiKey, s.claudeModel, name,
+            this.getTagCandidates().filter((t) => t.name !== cat),
+          )
+        : undefined,
+      onSubmit: (_name, criteria, icon) => {
+        const criteriaChanged = (s.tagDescriptions?.[cat] || "") !== criteria;
+        if (!s.tagDescriptions) s.tagDescriptions = {};
+        if (!s.tagIcons) s.tagIcons = {};
+        s.tagDescriptions[cat] = criteria;
+        s.tagIcons[cat] = icon;
+        if (criteriaChanged) {
+          if (!s.tagPromptVersions) s.tagPromptVersions = {};
+          bumpTagVersion(s.tagPromptVersions, cat);
+        }
+        void this.plugin.saveSettings();
+        this.messageViewer.setTagIcons(this.getTagIconMap());
+        this.rebuildTagWrap();
+      },
+    }).open();
   }
 
   private getTagCategories(): string[] {
     return parseTagCategories(this.plugin.settings.tagCategories);
+  }
+
+  private getTagCandidates(): TagCandidate[] {
+    const descriptions = this.plugin.settings.tagDescriptions || {};
+    return this.getTagCategories().map((name) => ({
+      name,
+      description: descriptions[name] || "",
+    }));
   }
 
   private getTagIconMap(): Map<string, string> {
@@ -1561,15 +1492,20 @@ export class InboxView extends ItemView {
   }
 
   private getClassifiableContent(msg: Message): string {
+    if (!msg.id) return [msg.subject, msg.bodyPreview].filter(Boolean).join("\n");
+    const processed = this.plugin.store.getProcessed(msg.id);
+    if (processed?.processedMarkdown) {
+      return [msg.subject, processed.processedMarkdown].filter(Boolean).join("\n");
+    }
+    const body = this.plugin.store.getBody(msg.id);
+    if (body?.strippedHtml) {
+      return [msg.subject, body.strippedHtml].filter(Boolean).join("\n");
+    }
     return [msg.subject, msg.bodyPreview].filter(Boolean).join("\n");
   }
 
   private getEffectiveTagPrompt(): string {
     return this.plugin.settings.tagClassifyPrompt || TAG_CLASSIFY_PROMPT;
-  }
-
-  private getEffectiveImportancePrompt(): string {
-    return this.plugin.settings.importanceClassifyPrompt || IMPORTANCE_CLASSIFY_PROMPT;
   }
 
   private handleTagChange(msg: Message, tag: string | null): void {
@@ -1618,26 +1554,25 @@ export class InboxView extends ItemView {
     }
   }
 
-  /** Call Claude Opus to refine the tag classification prompt based on feedback. */
-  /** Save a refined prompt, bump version, notify, and sync. */
-  private async applyRefinedPrompt(
-    type: "tag" | "importance",
-    refined: string,
-    noticeLabel: string,
-  ): Promise<void> {
-    if (type === "tag") {
-      this.plugin.settings.tagClassifyPrompt = refined;
-      this.plugin.settings.tagPromptVersion++;
-    } else {
-      this.plugin.settings.importanceClassifyPrompt = refined;
-      this.plugin.settings.importancePromptVersion++;
-    }
-    await this.plugin.saveSettings();
-    const ver = type === "tag"
-      ? this.plugin.settings.tagPromptVersion
-      : this.plugin.settings.importancePromptVersion;
-    new Notice(`${noticeLabel} (v${ver})`);
+  /** Save refined criteria for a single tag, bump only its version, notify, and sync. */
+  private applyRefinedTagCriteria(tag: string, refined: string, noticeLabel: string): void {
+    const s = this.plugin.settings;
+    if (!s.tagDescriptions) s.tagDescriptions = {};
+    if (!s.tagPromptVersions) s.tagPromptVersions = {};
+    s.tagDescriptions[tag] = refined;
+    bumpTagVersion(s.tagPromptVersions, tag);
+    void this.plugin.saveSettings();
+    new Notice(noticeLabel);
     this.syncPromptVersions();
+  }
+
+  /** Bump every defined tag's prompt version — used when the global meta-prompt changes. */
+  private bumpAllTagVersions(): void {
+    const s = this.plugin.settings;
+    if (!s.tagPromptVersions) s.tagPromptVersions = {};
+    for (const tag of this.getTagCategories()) {
+      bumpTagVersion(s.tagPromptVersions, tag);
+    }
   }
 
   private async refinePromptWithFeedback(
@@ -1646,66 +1581,22 @@ export class InboxView extends ItemView {
     feedback: "correct" | "incorrect",
   ): Promise<void> {
     const s = this.plugin.settings;
-    if (!s.anthropicApiKey) return;
+    if (!hasClaudeAccess(s.anthropicApiKey)) return;
 
     const content = this.getClassifiableContent(msg);
     if (!content) return;
 
     try {
-      const refined = await refineTagPrompt(
+      const refined = await refineTagCriteria(
         s.anthropicApiKey,
-        this.getEffectiveTagPrompt(),
-        content,
         tag,
+        s.tagDescriptions?.[tag] || "",
+        content,
         feedback,
       );
-      const label = feedback === "correct" ? "reinforced" : "corrected";
-      await this.applyRefinedPrompt("tag", refined, `Tag prompt ${label} by Opus`);
+      this.applyRefinedTagCriteria(tag, refined, `Criteria for "${tag}" changed`);
     } catch (err) {
-      logger.warn("InboxView", "Prompt refinement failed", err);
-    }
-  }
-
-  /** Manually set importance classification. */
-  private handleImportanceChange(msg: Message, importance: ImportanceClass): void {
-    if (!msg.id) return;
-
-    const wasAuto = this.classificationSourceCache.get(msg.id) === "auto";
-    const oldClassification = this.classifier.setManualClassification(msg.id, importance);
-
-    this.syncClassificationUI();
-    this.renderSelectedMessage(msg);
-
-    // If overriding an auto-classification, refine the prompt
-    if (wasAuto && oldClassification && oldClassification !== importance) {
-      void this.refineImportancePromptWithFeedback(msg, oldClassification, importance);
-    }
-  }
-
-  /** Call Claude Opus to refine the importance classification prompt. */
-  private async refineImportancePromptWithFeedback(
-    msg: Message,
-    oldClassification: string,
-    newClassification: string,
-  ): Promise<void> {
-    const s = this.plugin.settings;
-    if (!s.anthropicApiKey) return;
-
-    const content = this.getClassifiableContent(msg);
-    if (!content) return;
-
-    try {
-      const refined = await refineImportancePrompt(
-        s.anthropicApiKey,
-        this.getEffectiveImportancePrompt(),
-        content,
-        oldClassification,
-        newClassification,
-      );
-      await this.applyRefinedPrompt("importance", refined, "Importance prompt corrected by Opus");
-    } catch (err) {
-      logger.warn("InboxView", "Importance prompt refinement failed", err);
-      new Notice("Importance prompt refinement failed — classification still applied.");
+      logger.warn("InboxView", "Criteria refinement failed", err);
     }
   }
 
@@ -1714,18 +1605,12 @@ export class InboxView extends ItemView {
   /** Pre-process emails with Claude in the background so results are cached before the user clicks. */
   private async prefetchAllProcessed(): Promise<void> {
     const s = this.plugin.settings;
-    if (!s.enableClaudeProcessing || !s.anthropicApiKey) return;
+    if (!s.enableClaudeProcessing || !hasClaudeAccess(s.anthropicApiKey)) return;
 
     const limit = s.prefetchLimit;
     if (limit === 0) return;
 
     const gen = this.prefetchGeneration;
-
-    // Wait for classification to finish so we can skip noise
-    if (this.classifyAllPromise) {
-      try { await this.classifyAllPromise; } catch { /* proceed anyway */ }
-    }
-    if (this.prefetchGeneration !== gen) return;
 
     const effectivePrompt = s.claudeSystemPrompt || DEFAULT_CLAUDE_PROMPT;
     const promptHash = EmailStore.hashPrompt(effectivePrompt);
@@ -1757,14 +1642,6 @@ export class InboxView extends ItemView {
       if (cache.hasProcessed(msgId)) {
         const entry = cache.getProcessed(msgId)!;
         this.processedCache.set(msgId, entry.processedMarkdown);
-        skipSet.add(msgId);
-        continue;
-      }
-
-      // Skip noise
-      const classification = this.classificationCache.get(msgId);
-      if (classification === "noise") {
-        this.processedCache.set(msgId, "*Classification: noise — skipped processing*");
         skipSet.add(msgId);
         continue;
       }
@@ -1807,21 +1684,7 @@ export class InboxView extends ItemView {
       const parsedBody = htmlToMarkdown(stripped);
       if (!parsedBody) continue;
 
-      // Classify if not yet done
-      let msgClass = this.classificationCache.get(msgId);
-      if (!msgClass) {
-        try {
-          msgClass = await this.classifyAndCacheMessage(msgId, parsedBody);
-        } catch {
-          msgClass = "routine";
-        }
-      }
       if (this.prefetchGeneration !== gen) return;
-
-      if (msgClass === "noise") {
-        this.processedCache.set(msgId, "*Classification: noise — skipped processing*");
-        continue;
-      }
 
       // Prepend email context (subject, sender, date) for full context
       const parsedContent = this.buildEmailContext(msg) + parsedBody;
@@ -1839,9 +1702,8 @@ export class InboxView extends ItemView {
 
         this.processedCache.set(msgId, markdown);
 
-        const withFrontmatter = this.prependFrontmatter(msg, markdown);
         try {
-          await cache.setProcessed(msgId, markdown, withFrontmatter, promptHash, s.saveFolderPath, msg);
+          await cache.setProcessed(msgId, markdown, promptHash);
         } catch (err) {
           logger.warn("InboxView", `Prefetch save failed for ${msgId}`, err);
         }
@@ -1896,15 +1758,9 @@ export class InboxView extends ItemView {
 
   private async autoDetectItems(): Promise<void> {
     const s = this.plugin.settings;
-    if (!s.enableAutoItemDetection || !s.enableClaudeProcessing || !s.anthropicApiKey) return;
+    if (!s.enableAutoItemDetection || !s.enableClaudeProcessing || !hasClaudeAccess(s.anthropicApiKey)) return;
 
     const gen = this.prefetchGeneration;
-
-    // Wait for classification so we can skip noise
-    if (this.classifyAllPromise) {
-      try { await this.classifyAllPromise; } catch { /* proceed anyway */ }
-    }
-    if (this.prefetchGeneration !== gen) return;
 
     // Wait for prefetch so email bodies are cached
     if (this.prefetchAllPromise) {
@@ -1937,10 +1793,6 @@ export class InboxView extends ItemView {
         }
         continue;
       }
-
-      // Skip noise
-      const classification = this.classificationCache.get(msgId);
-      if (classification === "noise") continue;
 
       // Only use Claude-processed markdown — skip if not yet processed.
       const processed = cache.getProcessed(msgId);
@@ -1977,14 +1829,12 @@ export class InboxView extends ItemView {
    *  auto-detection background toggle. */
   private async detectItemsOnDemand(msg: Message): Promise<void> {
     const s = this.plugin.settings;
-    if (!s.enableClaudeProcessing || !s.anthropicApiKey) return;
+    if (!s.enableClaudeProcessing || !hasClaudeAccess(s.anthropicApiKey)) return;
 
     const msgId = msg.id;
     if (!msgId) return;
 
     const cache = this.plugin.store;
-    const classification = this.classificationCache.get(msgId);
-    if (classification === "noise") return;
 
     // Only use Claude-processed markdown — skip if not yet available
     const processed = cache.getProcessed(msgId);
@@ -2156,8 +2006,7 @@ export class InboxView extends ItemView {
   /** Push current prompt versions to MessageViewer and re-render the selected message. */
   private syncPromptVersions(): void {
     this.messageViewer.setPromptVersions(
-      this.plugin.settings.tagPromptVersion,
-      this.plugin.settings.importancePromptVersion,
+      this.plugin.settings.tagPromptVersions || {},
     );
     if (this.selectedMessageId) {
       const msg = this.messageState.messages.find((m) => m.id === this.selectedMessageId);
@@ -2169,10 +2018,10 @@ export class InboxView extends ItemView {
   private async handleRetagMessage(msg: Message): Promise<void> {
     if (!msg.id) return;
     const s = this.plugin.settings;
-    if (!s.enableClaudeProcessing || !s.anthropicApiKey) return;
+    if (!s.enableClaudeProcessing || !hasClaudeAccess(s.anthropicApiKey)) return;
 
-    const categories = this.getTagCategories();
-    if (categories.length === 0) return;
+    const candidates = this.getTagCandidates();
+    if (candidates.length === 0) return;
 
     const content = this.getClassifiableContent(msg);
     if (!content) return;
@@ -2185,20 +2034,19 @@ export class InboxView extends ItemView {
     }
 
     try {
-      const tags = await classifyEmailTags(
+      const tags = await classifyEmailTagsYesNo(
         s.anthropicApiKey,
         s.claudeModel,
         this.getEffectiveTagPrompt(),
         content,
-        categories,
+        candidates,
       );
 
-      const tagVer = s.tagPromptVersion;
       const newEntries: TagCacheEntry[] = tags.map((tag) => ({
         messageId: msg.id!,
         tag,
         source: "auto" as const,
-        promptVersion: tagVer,
+        promptVersion: getTagVersion(s.tagPromptVersions, tag),
         taggedAt: Date.now(),
       }));
       const merged = [...manual, ...newEntries];
@@ -2208,7 +2056,7 @@ export class InboxView extends ItemView {
         this.tagCache.delete(msg.id);
       }
       for (const tag of tags) {
-        this.plugin.store.setTag(msg.id, tag, "auto", tagVer);
+        this.plugin.store.setTag(msg.id, tag, "auto", getTagVersion(s.tagPromptVersions, tag));
       }
     } catch (err) {
       // On failure, keep manual tags only
@@ -2221,24 +2069,6 @@ export class InboxView extends ItemView {
     }
 
     this.messageViewer.setTagCache(this.tagCache);
-    this.renderSelectedMessage(msg);
-  }
-
-  /** Re-classify a single message with the current importance prompt. */
-  private async handleReclassifyMessage(msg: Message): Promise<void> {
-    if (!msg.id) return;
-    const s = this.plugin.settings;
-    if (!s.enableClaudeProcessing || !s.anthropicApiKey) return;
-
-    const content = this.getClassifiableContent(msg);
-    if (!content) return;
-
-    try {
-      await this.classifyAndCacheMessage(msg.id, content);
-    } catch (err) {
-      logger.warn("InboxView", "Re-classify failed", err);
-    }
-
     this.renderSelectedMessage(msg);
   }
 
@@ -2320,63 +2150,10 @@ export class InboxView extends ItemView {
       case "unread":
         this.plugin.updateBadge(msgs.filter((m) => !m.isRead).length);
         break;
-      case "important":
-        this.plugin.updateBadge(
-          msgs.filter(
-            (m) => !m.isRead && this.classificationCache.get(m.id || "") === "important",
-          ).length,
-        );
-        break;
       case "total":
         this.plugin.updateBadge(msgs.length);
         break;
     }
-  }
-
-  private groupByConversation(messages: Message[]): ConversationGroup[] {
-    const groups = new Map<string, Message[]>();
-
-    for (const msg of messages) {
-      const convId = msg.conversationId || msg.id || "";
-      const existing = groups.get(convId);
-      if (existing) {
-        existing.push(msg);
-      } else {
-        groups.set(convId, [msg]);
-      }
-    }
-
-    const conversations: ConversationGroup[] = [];
-    for (const [conversationId, msgs] of groups) {
-      msgs.sort(
-        (a, b) =>
-          new Date(a.receivedDateTime || 0).getTime() -
-          new Date(b.receivedDateTime || 0).getTime(),
-      );
-
-      const latestMessage = msgs[msgs.length - 1];
-      const subject = (latestMessage.subject || "").replace(
-        /^(?:re|fw|fwd):\s*/i,
-        "",
-      );
-
-      conversations.push({
-        conversationId,
-        messages: msgs,
-        subject,
-        latestMessage,
-        unreadCount: msgs.filter((m) => !m.isRead).length,
-      });
-    }
-
-    const dir = this.sortNewestFirst ? -1 : 1;
-    conversations.sort(
-      (a, b) =>
-        dir * (new Date(a.latestMessage.receivedDateTime || 0).getTime() -
-        new Date(b.latestMessage.receivedDateTime || 0).getTime()),
-    );
-
-    return conversations;
   }
 
   /** Build an email context header (subject, sender, date) to prepend to body
@@ -2395,30 +2172,6 @@ export class InboxView extends ItemView {
     return lines.length > 0 ? lines.join("\n") + "\n\n" : "";
   }
 
-  private prependFrontmatter(msg: Message, markdown: string): string {
-    const dt = msg.receivedDateTime ? new Date(msg.receivedDateTime) : null;
-    const date = dt ? dt.toISOString().split("T")[0] : "unknown";
-    const time = dt
-      ? dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-      : "unknown";
-    const from =
-      msg.from?.emailAddress?.name ||
-      msg.from?.emailAddress?.address ||
-      "unknown";
-    const displayTitle = msg.subject || "no subject";
-
-    const frontmatter = [
-      "---",
-      `displayTitle: "${displayTitle.replace(/"/g, '\\"')}"`,
-      `date: ${date}`,
-      `time: "${time}"`,
-      `from: "${from.replace(/"/g, '\\"')}"`,
-      "---",
-    ].join("\n");
-
-    return `${frontmatter}\n\n${markdown.trimStart()}`;
-  }
-
   // ── Note creation from selected email text ────────────────────
 
   private async handleCreateNoteFromSelection(
@@ -2427,8 +2180,8 @@ export class InboxView extends ItemView {
     msg: Message,
   ): Promise<void> {
     const s = this.plugin.settings;
-    if (!s.anthropicApiKey) {
-      new Notice("Please configure your Anthropic API key in Iris Mail settings.");
+    if (!hasClaudeAccess(s.anthropicApiKey)) {
+      new Notice("Please configure an Anthropic API key in Iris Mail settings or enable the Iris Router plugin.");
       return;
     }
 

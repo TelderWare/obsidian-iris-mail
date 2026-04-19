@@ -82,24 +82,4 @@ export class GraphMailApi {
       .update({ isRead: false });
   }
 
-  async getConversationMessages(
-    conversationId: string,
-  ): Promise<Message[]> {
-    const response: GraphPagedResponse<Message> = await this.getClient()
-      .api("/me/messages")
-      .filter(`conversationId eq '${conversationId}'`)
-      .select(
-        "id,subject,body,from,toRecipients,ccRecipients,receivedDateTime,isRead,hasAttachments",
-      )
-      .expand("attachments($select=id,name,size,contentType,isInline)")
-      .top(50)
-      .get();
-
-    // Sort client-side (Graph API doesn't allow orderby with conversationId filter)
-    return response.value.sort(
-      (a, b) =>
-        new Date(a.receivedDateTime || 0).getTime() -
-        new Date(b.receivedDateTime || 0).getTime(),
-    );
-  }
 }

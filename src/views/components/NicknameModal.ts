@@ -6,6 +6,7 @@ export class NicknameModal extends Modal {
   private currentNickname: string;
   private onSave: (address: string, nickname: string) => void;
   private onDelete: (address: string) => void;
+  private onRegenerate?: () => Promise<string>;
 
   constructor(
     app: App,
@@ -14,6 +15,7 @@ export class NicknameModal extends Modal {
     currentNickname: string,
     onSave: (address: string, nickname: string) => void,
     onDelete: (address: string) => void,
+    onRegenerate?: () => Promise<string>,
   ) {
     super(app);
     this.address = address;
@@ -21,6 +23,7 @@ export class NicknameModal extends Modal {
     this.currentNickname = currentNickname;
     this.onSave = onSave;
     this.onDelete = onDelete;
+    this.onRegenerate = onRegenerate;
   }
 
   onOpen(): void {
@@ -33,10 +36,12 @@ export class NicknameModal extends Modal {
     });
 
     let value = this.currentNickname;
+    let textInput: HTMLInputElement | null = null;
 
     new Setting(contentEl)
       .setName("Nickname")
       .addText((text) => {
+        textInput = text.inputEl;
         text
           .setPlaceholder(this.rawName)
           .setValue(this.currentNickname)
@@ -52,7 +57,7 @@ export class NicknameModal extends Modal {
         setTimeout(() => text.inputEl.focus(), 10);
       });
 
-    new Setting(contentEl)
+    const buttonRow = new Setting(contentEl)
       .addButton((btn) =>
         btn
           .setButtonText("Save")
@@ -61,7 +66,28 @@ export class NicknameModal extends Modal {
             this.onSave(this.address, value.trim());
             this.close();
           }),
-      )
+      );
+
+    if (this.onRegenerate) {
+      buttonRow.addButton((btn) => {
+        btn.setButtonText("Regenerate").onClick(async () => {
+          if (!this.onRegenerate || !textInput) return;
+          const prev = btn.buttonEl.textContent;
+          btn.setDisabled(true).setButtonText("…");
+          try {
+            const next = await this.onRegenerate();
+            value = next;
+            textInput.value = next;
+          } catch {
+            // Keep modal open; user can retry or cancel.
+          } finally {
+            btn.setDisabled(false).setButtonText(prev || "Regenerate");
+          }
+        });
+      });
+    }
+
+    buttonRow
       .addButton((btn) =>
         btn
           .setButtonText("Delete")

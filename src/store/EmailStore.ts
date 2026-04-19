@@ -1,4 +1,4 @@
-import type { App } from "obsidian";
+import type { App, Plugin } from "obsidian";
 import { stripQuotedContent } from "../utils/stripQuotedContent";
 import { extractForwardedSender } from "../utils/extractForwardedSender";
 import { logger } from "../utils/logger";
@@ -6,104 +6,119 @@ import type { Message } from "../types";
 import type {
   BodyCacheEntry,
   ProcessedCacheEntry,
-  ClassificationCacheEntry,
-  ImportanceClass,
   TagCacheEntry,
   DetectedItemEntry,
   DetectedItemStatus,
   EmailStoreIndex,
+  MessageListCacheEntry,
 } from "./types";
 
-const STORE_DIR = ".obsidian/plugins/iris-mail/cache";
-const INDEX_PATH = `${STORE_DIR}/index.json`;
-const BODIES_PATH = `${STORE_DIR}/bodies.json`;
-/** Legacy single-file path — migrated on first load. */
-const LEGACY_STORE_PATH = ".obsidian/plugins/iris-mail/email-store.json";
+/** Legacy paths migrated into data.json on first load. */
+const LEGACY_STORE_DIR = ".obsidian/plugins/iris-mail/cache";
+const LEGACY_INDEX_PATH = `${LEGACY_STORE_DIR}/index.json`;
+const LEGACY_BODIES_PATH = `${LEGACY_STORE_DIR}/bodies.json`;
+const LEGACY_SINGLE_STORE_PATH = ".obsidian/plugins/iris-mail/email-store.json";
+
+/** Key under which the cache is stored in the plugin's data.json. */
+const DATA_CACHE_KEY = "__cache";
 
 const SAVE_DEBOUNCE_MS = 2000;
 
 function emptyIndex(): EmailStoreIndex {
-  return { version: 1, bodies: {}, processed: {}, classifications: {}, nicknames: {}, readMessages: {}, tags: {}, detectedItems: {}, itemsScanned: {}, deletedNicknames: {} };
+  return { version: 1, bodies: {}, messageLists: {}, processed: {}, nicknames: {}, readMessages: {}, tags: {}, detectedItems: {}, itemsScanned: {}, deletedNicknames: {} };
 }
 
 export class EmailStore {
   private app: App;
+  private plugin: Plugin;
   private index: EmailStoreIndex = emptyIndex();
   private dirty = false;
   private bodiesDirty = false;
   private saveTimeout: number | null = null;
 
-  constructor(app: App) {
-    this.app = app;
+  constructor(plugin: Plugin) {
+    this.plugin = plugin;
+    this.app = plugin.app;
   }
 
   // ── Lifecycle ──────────────────────────────────────────────
 
   async load(): Promise<void> {
     try {
-      // Migrate from legacy single-file format
-      if (await this.app.vault.adapter.exists(LEGACY_STORE_PATH)) {
-        const raw = await this.app.vault.adapter.read(LEGACY_STORE_PATH);
-        const parsed = JSON.parse(raw);
-        if (parsed?.version === 1) {
-          const defaults = emptyIndex();
-          this.index = { ...defaults, ...parsed } as EmailStoreIndex;
-          this.migrateTags();
-          // Write split files and remove legacy
-          await this.ensureCacheDir();
-          await this.save();
-          await this.app.vault.adapter.remove(LEGACY_STORE_PATH);
-          logger.info("Store", "Migrated legacy email-store.json to split cache files");
-          return;
-        }
+      const data = (await this.plugin.loadData()) ?? {};
+      const cached = data[DATA_CACHE_KEY];
+      if (cached?.version === 1) {
+        this.index = { ...emptyIndex(), ...cached } as EmailStoreIndex;
+        this.migrateTags();
+        return;
       }
 
-      // Load split cache files
-      if (await this.app.vault.adapter.exists(INDEX_PATH)) {
-        const raw = await this.app.vault.adapter.read(INDEX_PATH);
-        const parsed = JSON.parse(raw);
-        if (parsed?.version === 1) {
-          const defaults = emptyIndex();
-          // Bodies are stored separately
-          const bodies = await this.loadBodies();
-          this.index = { ...defaults, ...parsed, bodies } as EmailStoreIndex;
-          this.migrateTags();
-        } else {
-          logger.warn("Store", "Cache index version mismatch, resetting");
-          this.index = emptyIndex();
-        }
+      // Migrate legacy cache files into data.json
+      const migrated = await this.migrateLegacyCache();
+      if (migrated) {
+        this.migrateTags();
+        await this.save();
       }
     } catch (err) {
-      logger.warn("Store", "Failed to load cache index, starting fresh", err);
+      logger.warn("Store", "Failed to load cache, starting fresh", err);
       this.index = emptyIndex();
     }
   }
 
-  async save(): Promise<void> {
+  private async migrateLegacyCache(): Promise<boolean> {
+    const adapter = this.app.vault.adapter;
     try {
-      await this.ensureCacheDir();
-      // Write index (everything except bodies) and bodies separately
-      const { bodies, ...indexWithoutBodies } = this.index;
-      await this.app.vault.adapter.write(INDEX_PATH, JSON.stringify(indexWithoutBodies));
-      if (this.bodiesDirty) {
-        await this.app.vault.adapter.write(BODIES_PATH, JSON.stringify(bodies));
-        this.bodiesDirty = false;
+      if (await adapter.exists(LEGACY_SINGLE_STORE_PATH)) {
+        const raw = await adapter.read(LEGACY_SINGLE_STORE_PATH);
+        const parsed = JSON.parse(raw);
+        if (parsed?.version === 1) {
+          this.index = { ...emptyIndex(), ...parsed } as EmailStoreIndex;
+          await adapter.remove(LEGACY_SINGLE_STORE_PATH);
+          logger.info("Store", "Migrated legacy email-store.json into data.json");
+          return true;
+        }
       }
-      this.dirty = false;
+      if (await adapter.exists(LEGACY_INDEX_PATH)) {
+        const raw = await adapter.read(LEGACY_INDEX_PATH);
+        const parsed = JSON.parse(raw);
+        if (parsed?.version === 1) {
+          let bodies: Record<string, BodyCacheEntry> = {};
+          if (await adapter.exists(LEGACY_BODIES_PATH)) {
+            try {
+              bodies = JSON.parse(await adapter.read(LEGACY_BODIES_PATH));
+            } catch (err) {
+              logger.warn("Store", "Failed to read legacy bodies.json", err);
+            }
+          }
+          this.index = { ...emptyIndex(), ...parsed, bodies } as EmailStoreIndex;
+          try {
+            await adapter.remove(LEGACY_INDEX_PATH);
+            if (await adapter.exists(LEGACY_BODIES_PATH)) await adapter.remove(LEGACY_BODIES_PATH);
+            if (await adapter.exists(LEGACY_STORE_DIR)) await adapter.rmdir(LEGACY_STORE_DIR, true);
+          } catch (err) {
+            logger.warn("Store", "Failed to clean up legacy cache files", err);
+          }
+          logger.info("Store", "Migrated legacy split cache files into data.json");
+          return true;
+        }
+      }
     } catch (err) {
-      logger.warn("Store", "Failed to save cache index", err);
+      logger.warn("Store", "Legacy cache migration failed", err);
     }
+    return false;
   }
 
-  private async loadBodies(): Promise<Record<string, BodyCacheEntry>> {
+  async save(): Promise<void> {
     try {
-      if (await this.app.vault.adapter.exists(BODIES_PATH)) {
-        return JSON.parse(await this.app.vault.adapter.read(BODIES_PATH));
-      }
+      // Read-modify-write to avoid clobbering plugin settings that share data.json
+      const data = (await this.plugin.loadData()) ?? {};
+      data[DATA_CACHE_KEY] = this.index;
+      await this.plugin.saveData(data);
+      this.dirty = false;
+      this.bodiesDirty = false;
     } catch (err) {
-      logger.warn("Store", "Failed to load bodies cache", err);
+      logger.warn("Store", "Failed to save cache", err);
     }
-    return {};
   }
 
   private migrateTags(): void {
@@ -111,12 +126,6 @@ export class EmailStore {
       if (val && !Array.isArray(val) && (val as TagCacheEntry).tag) {
         (this.index.tags as Record<string, unknown>)[id] = [val];
       }
-    }
-  }
-
-  private async ensureCacheDir(): Promise<void> {
-    if (!(await this.app.vault.adapter.exists(STORE_DIR))) {
-      await this.app.vault.adapter.mkdir(STORE_DIR);
     }
   }
 
@@ -149,7 +158,6 @@ export class EmailStore {
       : undefined;
     const entry: BodyCacheEntry = {
       messageId: msg.id!,
-      conversationId: msg.conversationId || "",
       subject,
       from: msg.from?.emailAddress?.address || "",
       receivedDateTime: msg.receivedDateTime || "",
@@ -164,18 +172,23 @@ export class EmailStore {
     return entry;
   }
 
-  getConversationBodies(conversationId: string): BodyCacheEntry[] {
-    return Object.values(this.index.bodies)
-      .filter((e) => e.conversationId === conversationId)
-      .sort(
-        (a, b) =>
-          new Date(a.receivedDateTime).getTime() -
-          new Date(b.receivedDateTime).getTime(),
-      );
+  // ── Message list cache ─────────────────────────────────────
+
+  private listKey(folderId: string, showRead: boolean): string {
+    return `${folderId}:${showRead ? "all" : "unread"}`;
   }
 
-  hasFullConversation(messageIds: string[]): boolean {
-    return messageIds.every((id) => this.hasBody(id));
+  getMessageList(folderId: string, showRead: boolean): MessageListCacheEntry | undefined {
+    return this.index.messageLists[this.listKey(folderId, showRead)];
+  }
+
+  setMessageList(folderId: string, showRead: boolean, messages: Message[], nextLink: string | null): void {
+    this.index.messageLists[this.listKey(folderId, showRead)] = {
+      messages,
+      nextLink,
+      cachedAt: Date.now(),
+    };
+    this.scheduleSave();
   }
 
   // ── Processed cache ────────────────────────────────────────
@@ -199,71 +212,19 @@ export class EmailStore {
   async setProcessed(
     messageId: string,
     markdown: string,
-    fileContent: string,
     promptHash: string,
-    saveFolderPath: string,
-    msg: Message,
   ): Promise<ProcessedCacheEntry> {
-    const vaultPath = this.buildVaultPath(saveFolderPath, msg);
-    await this.ensureFolder(saveFolderPath);
-
-    // Write the vault file with frontmatter
-    const existing = this.app.vault.getAbstractFileByPath(vaultPath);
-    if (existing) {
-      await this.app.vault.modify(existing as never, fileContent);
-    } else {
-      await this.app.vault.create(vaultPath, fileContent);
-    }
-
-    // Cache the raw markdown (no frontmatter) for viewer display
+    // Stored in data.json only; no vault file is created.
     const entry: ProcessedCacheEntry = {
       messageId,
       promptHash,
       processedMarkdown: markdown,
-      vaultPath,
+      vaultPath: "",
       processedAt: Date.now(),
     };
     this.index.processed[messageId] = entry;
     this.scheduleSave();
     return entry;
-  }
-
-  // ── Classification cache ──────────────────────────────────
-
-  getClassification(messageId: string): ImportanceClass | undefined {
-    return this.index.classifications[messageId]?.classification;
-  }
-
-  setClassification(messageId: string, classification: ImportanceClass, source: "auto" | "manual" = "auto", promptVersion?: number): void {
-    this.index.classifications[messageId] = {
-      messageId,
-      classification,
-      source,
-      promptVersion,
-      classifiedAt: Date.now(),
-    };
-    this.scheduleSave();
-  }
-
-  /** Return all classification data in a single pass: classes, sources, and versions. */
-  getAllClassificationData(): {
-    classes: Map<string, ImportanceClass>;
-    sources: Map<string, "auto" | "manual">;
-    versions: Map<string, number | undefined>;
-  } {
-    const classes = new Map<string, ImportanceClass>();
-    const sources = new Map<string, "auto" | "manual">();
-    const versions = new Map<string, number | undefined>();
-    for (const [id, entry] of Object.entries(this.index.classifications)) {
-      classes.set(id, entry.classification);
-      sources.set(id, entry.source || "auto");
-      versions.set(id, entry.promptVersion);
-    }
-    return { classes, sources, versions };
-  }
-
-  getClassificationSource(messageId: string): "auto" | "manual" {
-    return this.index.classifications[messageId]?.source || "auto";
   }
 
   // ── Nickname cache ────────────────────────────────────────
@@ -459,27 +420,6 @@ export class EmailStore {
   }
 
   // ── Internal ───────────────────────────────────────────────
-
-  private buildVaultPath(folderPath: string, msg: Message): string {
-    const date = msg.receivedDateTime
-      ? new Date(msg.receivedDateTime).toISOString().split("T")[0]
-      : "unknown";
-    const subject = (msg.subject || "no-subject")
-      .replace(/^(?:re|fw|fwd)\s*:\s*/i, "")  // strip reply/forward prefix
-      .replace(/[\\/:*?"<>|]/g, "")            // remove illegal chars (don't replace with -)
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 50);
-    // Short hash of message ID to avoid collisions
-    const idHash = EmailStore.hashPrompt(msg.id || "").slice(0, 5);
-    return `${folderPath}/${date} ${subject} ${idHash}.md`;
-  }
-
-  private async ensureFolder(path: string): Promise<void> {
-    if (!(await this.app.vault.adapter.exists(path))) {
-      await this.app.vault.createFolder(path);
-    }
-  }
 
   private scheduleSave(): void {
     this.dirty = true;

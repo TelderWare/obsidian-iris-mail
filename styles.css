@@ -31,6 +31,49 @@
   overflow: hidden;
 }
 
+/* When vertical space is at a premium, hide the top toolbar. */
+.iris-mail-container.iris-compact .iris-topbar {
+  display: none;
+}
+
+.iris-mail-container.iris-compact .iris-empty-state,
+.iris-mail-container.iris-compact .iris-loading {
+  padding-bottom: 24px;
+}
+
+/* In compact mode with a viewer open, hide the message list so the viewer
+   takes the full pane width.  The viewer's compact-back button lets the
+   user return to the list. */
+.iris-mail-container.iris-compact .iris-right-pane.has-viewer .iris-message-list {
+  display: none;
+}
+
+/* Compact-mode back button in the viewer header — hidden at normal sizes. */
+.iris-viewer-compact-back {
+  display: none;
+}
+
+.iris-mail-container.iris-compact .iris-viewer-compact-back {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  cursor: pointer;
+  flex-shrink: 0;
+  border-radius: 4px;
+  color: var(--text-muted);
+  border: none;
+  background: none;
+  transition: background-color 150ms ease, color 150ms ease;
+}
+
+.iris-mail-container.iris-compact .iris-viewer-compact-back:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
 /* Top bar */
 .iris-topbar {
   display: flex;
@@ -76,17 +119,11 @@
   color: var(--text-on-accent);
 }
 
-/* Filter expand-on-hover */
+/* Filter expand-on-hover — parent auto-sizes from child widths */
 .iris-filter-wrap {
   display: flex;
   align-items: center;
   overflow: hidden;
-  width: 28px;
-  transition: width 200ms ease;
-}
-
-.iris-filter-wrap.has-options:hover {
-  width: 112px; /* 28px × 4 icons */
 }
 
 .iris-filter-opt {
@@ -127,18 +164,11 @@
   color: var(--interactive-accent);
 }
 
-/* Tag expand-on-hover */
+/* Tag expand-on-hover — parent auto-sizes from child widths */
 .iris-tag-wrap {
-  --tag-expanded-width: 56px;
   display: flex;
   align-items: center;
   overflow: hidden;
-  width: 28px;
-  transition: width 200ms ease;
-}
-
-.iris-tag-wrap:hover {
-  width: var(--tag-expanded-width);
 }
 
 .iris-tag-wrap:hover .iris-filter-opt {
@@ -306,6 +336,20 @@ input.iris-add-tag-input {
 
 .iris-msg-row.is-selected {
   background: color-mix(in srgb, var(--interactive-accent) 12%, transparent);
+}
+
+.iris-msg-row.is-collapsing {
+  overflow: hidden;
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+  border-bottom-width: 0;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    height 220ms ease,
+    padding 220ms ease,
+    opacity 180ms ease,
+    border-bottom-width 220ms ease;
 }
 
 .iris-msg-row.is-unread .iris-msg-sender {
@@ -676,19 +720,20 @@ input.iris-add-tag-input {
 }
 
 .iris-empty-icon svg {
-  width: 32px;
-  height: 32px;
+  width: 24px;
+  height: 24px;
   stroke-width: 1.5;
 }
 
 .iris-empty-title {
-  font-size: 15px;
+  font-size: 12px;
   font-weight: 500;
+  font-style: normal;
   color: var(--text-normal);
 }
 
 .iris-empty-desc {
-  font-size: 13px;
+  font-size: 11px;
   color: var(--text-muted);
 }
 
@@ -781,6 +826,17 @@ input.iris-add-tag-input {
 }
 
 .iris-msg-importance svg {
+  width: 14px;
+  height: 14px;
+}
+
+.iris-msg-noise {
+  color: var(--text-faint);
+  display: inline-flex;
+  align-items: center;
+}
+
+.iris-msg-noise svg {
   width: 14px;
   height: 14px;
 }
@@ -966,26 +1022,191 @@ input.iris-add-tag-input {
   color: var(--text-faint);
 }
 
+/* Create-tag modal */
+.iris-create-tag-modal .iris-create-tag-field {
+  margin-bottom: 16px;
+}
+
+.iris-create-tag-label {
+  display: block;
+  margin-bottom: 6px;
+  font-weight: 500;
+}
+
+.iris-create-tag-name-row {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.iris-create-tag-name-row .iris-create-tag-input {
+  flex: 1;
+}
+
+.iris-create-tag-icon {
+  width: 36px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.iris-create-tag-icon:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.iris-create-tag-icon svg {
+  width: 18px;
+  height: 18px;
+}
+
+.iris-create-tag-input.is-locked {
+  background: var(--background-modifier-hover);
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+.iris-create-tag-input,
+.iris-create-tag-textarea {
+  width: 100%;
+  padding: 6px 10px;
+  font-family: inherit;
+  font-size: 13px;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  box-sizing: border-box;
+}
+
+.iris-create-tag-textarea {
+  resize: vertical;
+  min-height: 80px;
+}
+
+.iris-create-tag-crit-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.iris-create-tag-crit-header .iris-create-tag-label {
+  margin-bottom: 0;
+}
+
+.iris-create-tag-generate {
+  font-size: 12px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+
+.iris-create-tag-generate:disabled {
+  cursor: progress;
+  opacity: 0.6;
+}
+
+.iris-create-tag-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+/* Icon picker modal */
+.iris-icon-picker-modal .iris-icon-picker-search {
+  width: 100%;
+  margin-bottom: 12px;
+  padding: 6px 10px;
+  font-size: 13px;
+}
+
+.iris-icon-picker-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, 36px);
+  gap: 4px;
+  max-height: 60vh;
+  overflow-y: auto;
+  padding: 4px 2px;
+}
+
+.iris-icon-picker-cell {
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  cursor: pointer;
+  background: none;
+  border: 1px solid transparent;
+  color: var(--text-muted);
+}
+
+.iris-icon-picker-cell:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.iris-icon-picker-cell.is-active {
+  border-color: var(--interactive-accent);
+  color: var(--interactive-accent);
+}
+
+.iris-icon-picker-cell svg {
+  width: 18px;
+  height: 18px;
+}
+
+.iris-icon-picker-overflow,
+.iris-icon-picker-empty {
+  grid-column: 1 / -1;
+  padding: 12px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
 /* Settings: tag list with icons */
 .iris-settings-tag-list {
   display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
+  flex-direction: column;
+  gap: 8px;
   padding: 8px 0 4px;
 }
 
 .iris-settings-tag-item {
-  display: inline-flex;
+  display: flex;
   align-items: center;
-  gap: 4px;
-  padding: 2px 10px 2px 4px;
-  border-radius: 10px;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 6px;
   background: var(--background-modifier-hover);
-  font-size: 12px;
+  font-size: 13px;
   color: var(--text-normal);
 }
 
-.iris-settings-tag-icon {
+.iris-settings-tag-item.is-clickable {
+  cursor: pointer;
+}
+
+.iris-settings-tag-item.is-clickable:hover {
+  background: var(--background-modifier-active-hover);
+}
+
+.iris-settings-tag-name {
+  flex: 1;
+  font-weight: 500;
+}
+
+.iris-settings-tag-delete {
   width: 24px;
   height: 24px;
   padding: 0;
@@ -994,17 +1215,46 @@ input.iris-add-tag-input {
   justify-content: center;
   border-radius: 4px;
   cursor: pointer;
+  color: var(--text-faint);
+  background: none;
+  border: none;
+}
+
+.iris-settings-tag-delete:hover {
+  background: var(--background-modifier-error-hover);
+  color: var(--text-error);
+}
+
+.iris-settings-tag-delete svg {
+  width: 14px;
+  height: 14px;
+}
+
+.iris-settings-tag-warn {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-warning, #d29922);
+}
+
+.iris-settings-tag-warn svg {
+  width: 14px;
+  height: 14px;
+}
+
+.iris-settings-tag-item.needs-description {
+  background: var(--background-modifier-error-hover, rgba(210, 153, 34, 0.08));
+  border: 1px solid var(--text-warning, #d29922);
+}
+
+.iris-settings-tag-icon {
+  display: inline-flex;
+  align-items: center;
   color: var(--text-muted);
 }
 
-.iris-settings-tag-icon:hover {
-  background: var(--background-modifier-border);
-  color: var(--text-normal);
-}
-
 .iris-settings-tag-icon svg {
-  width: 14px;
-  height: 14px;
+  width: 16px;
+  height: 16px;
 }
 
 /* Batch action panel */
@@ -1356,5 +1606,73 @@ select.iris-detected-item-inline-meta {
   background: var(--background-modifier-hover);
   color: var(--text-normal);
 }
+
+/* Inline Client ID entry (shown in sign-in prompt) */
+.iris-clientid-entry {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: min(360px, 90%);
+  margin-top: 4px;
+  animation: iris-clientid-fade 160ms ease-out;
+}
+@keyframes iris-clientid-fade {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.iris-clientid-label {
+  font-size: 0.82em;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.iris-clientid-input-wrap {
+  display: flex;
+}
+.iris-clientid-input {
+  width: 100%;
+  padding: 10px 12px;
+  font-family: var(--font-monospace);
+  font-size: 0.92em;
+  border-radius: 8px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  color: var(--text-normal);
+  box-sizing: border-box;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+.iris-clientid-input:focus {
+  outline: none;
+  border-color: var(--interactive-accent);
+  box-shadow: 0 0 0 2px var(--interactive-accent-hover, var(--interactive-accent));
+}
+.iris-clientid-error {
+  min-height: 1.1em;
+  margin-top: 6px;
+  color: var(--text-error);
+  font-size: 0.82em;
+}
+.iris-clientid-help {
+  display: inline-block;
+  margin-top: 4px;
+  font-size: 0.82em;
+  color: var(--text-muted);
+  text-decoration: none;
+}
+.iris-clientid-help:hover {
+  color: var(--text-accent);
+  text-decoration: underline;
+}
+.iris-clientid-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+
+
+
 
 

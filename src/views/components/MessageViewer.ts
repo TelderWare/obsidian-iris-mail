@@ -1,6 +1,6 @@
 import { App, MarkdownRenderer, Menu, sanitizeHTMLToDom, setIcon } from "obsidian";
 import type { Message } from "../../types";
-import type { ImportanceClass, TagCacheEntry, DetectedItemEntry } from "../../store/types";
+import type { TagCacheEntry, DetectedItemEntry } from "../../store/types";
 import type { NameResolver, EffectiveSenderResolver } from "./MessageList";
 import type { NoteType } from "../../utils/claudeApi";
 import { formatRelativeDate, formatItemDate } from "../../utils/dateFormat";
@@ -9,20 +9,14 @@ interface MessageViewerCallbacks {
   onMarkAsRead: (msg: Message) => void;
   onMarkAsUnread: (msg: Message) => void;
   onTagChange: (msg: Message, tag: string | null) => void;
-  /** Manually change importance classification. */
-  onImportanceChange: (msg: Message, importance: ImportanceClass) => void;
   /** Re-tag a message with the current prompt (replaces obsolete auto-tags). */
   onRetagMessage: (msg: Message) => void;
-  /** Re-classify a message with the current prompt (replaces obsolete auto-classification). */
-  onReclassifyMessage: (msg: Message) => void;
   /** Batch mark selected messages as read. */
   onBatchMarkAsRead: (ids: Set<string>) => void;
   /** Batch mark selected messages as unread. */
   onBatchMarkAsUnread: (ids: Set<string>) => void;
   /** Batch assign a tag to selected messages. */
   onBatchTag: (ids: Set<string>, tag: string) => void;
-  /** Bulk deny importance: merge emails into formula, then refine prompt. */
-  onBulkDenyImportance: (ids: Set<string>, oldClassification: ImportanceClass, newClassification: ImportanceClass) => void;
   /** Bulk deny tag: remove tag from all selected, merge into formula, refine prompt. */
   onBulkDenyTag: (ids: Set<string>, tag: string) => void;
   /** Create an Event or Task note from selected text in the email body. */
@@ -39,6 +33,8 @@ interface MessageViewerCallbacks {
   onReprocessMessage: (msg: Message) => void;
   /** Open the nickname editor for an address. */
   onEditNickname: (address: string, rawName: string) => void;
+  /** Dismiss the viewer (used by compact back button). */
+  onDismiss?: () => void;
 }
 
 export class MessageViewer {
@@ -51,11 +47,7 @@ export class MessageViewer {
   private processedMarkdown: string | null = null;
   private showingProcessed = false;
   private currentMsg: Message | null = null;
-  private classification: ImportanceClass | null = null;
-  private classificationSource: "auto" | "manual" = "auto";
-  private classificationPromptVersion: number | undefined = undefined;
-  private currentTagPromptVersion = 1;
-  private currentImportancePromptVersion = 1;
+  private currentTagPromptVersions: Record<string, number> = {};
   private tagCategories: string[] = [];
   private tagIcons = new Map<string, string>();
   private tagCache = new Map<string, TagCacheEntry[]>();
@@ -98,31 +90,97 @@ export class MessageViewer {
     this.detectedItems = items;
   }
 
-  setPromptVersions(tagVersion: number, importanceVersion: number): void {
-    this.currentTagPromptVersion = tagVersion;
-    this.currentImportancePromptVersion = importanceVersion;
+  setPromptVersions(tagVersions: Record<string, number>): void {
+    this.currentTagPromptVersions = tagVersions;
   }
 
   /** Render a single message with its stripped HTML body. */
   render(
     msg: Message,
     strippedHtml: string,
-    classification?: ImportanceClass,
-    classificationSource?: "auto" | "manual",
-    classificationPromptVersion?: number,
   ): void {
     const sameMessage = msg.id != null && msg.id === this.currentMessageId;
+    const hadPrevious = !sameMessage && this.currentMsg !== null;
+
     this.currentMessageId = msg.id || null;
     this.currentMsg = msg;
     this.currentHtml = strippedHtml;
-    this.classification = classification || null;
-    this.classificationSource = classificationSource || "auto";
-    this.classificationPromptVersion = classificationPromptVersion;
     if (!sameMessage) {
       this.processedMarkdown = null;
       this.showingProcessed = false;
     }
-    this.rebuildView();
+
+    if (hadPrevious) {
+      this.animateSwap(() => this.rebuildView());
+    } else {
+      this.rebuildView();
+    }
+  }
+
+  /**
+   * Cross-fade + slight vertical slide when swapping from one message to
+   * another. Analogous to the list FLIP animation: the outgoing content
+   * collapses upward while the incoming content rises into place, both over
+   * the same 220ms window.
+   */
+  private animateSwap(rebuild: () => void): void {
+    if (
+      typeof window !== "undefined"
+      && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
+    ) {
+      rebuild();
+      return;
+    }
+    const DURATION = 220;
+    const container = this.containerEl;
+
+    const scrollTop = container.scrollTop;
+    const ghost = container.cloneNode(true) as HTMLElement;
+    ghost.removeClass("iris-message-viewer");
+    ghost.addClass("iris-viewer-ghost");
+    ghost.style.position = "absolute";
+    ghost.style.top = `${scrollTop}px`;
+    ghost.style.left = "0";
+    ghost.style.right = "0";
+    ghost.style.pointerEvents = "none";
+    ghost.style.zIndex = "2";
+    ghost.style.overflow = "hidden";
+
+    rebuild();
+    container.appendChild(ghost);
+
+    // Force reflow before applying transition targets.
+    void ghost.offsetHeight;
+    ghost.style.transition =
+      `transform ${DURATION}ms ease, opacity ${DURATION}ms ease`;
+    ghost.style.transform = "translateY(-12px)";
+    ghost.style.opacity = "0";
+
+    // Animate the incoming (rebuilt) children in.
+    const incoming = Array.from(container.children).filter(
+      (c) => c !== ghost,
+    ) as HTMLElement[];
+    for (const el of incoming) {
+      el.style.transition = "none";
+      el.style.transform = "translateY(12px)";
+      el.style.opacity = "0";
+    }
+    void container.offsetHeight;
+    for (const el of incoming) {
+      el.style.transition =
+        `transform ${DURATION}ms ease, opacity ${DURATION}ms ease`;
+      el.style.transform = "";
+      el.style.opacity = "";
+    }
+
+    setTimeout(() => {
+      ghost.remove();
+      for (const el of incoming) {
+        el.style.transition = "";
+        el.style.transform = "";
+        el.style.opacity = "";
+      }
+    }, DURATION + 40);
   }
 
   /** Re-render the current message without resetting toggle state. */
@@ -207,43 +265,6 @@ export class MessageViewer {
       this.callbacks.onBatchMarkAsUnread(new Set(selectedIds));
     });
 
-    // Bulk deny importance: pick what the current classification is, then what it should be
-    const denyImportanceBtn = actions.createEl("button", {
-      cls: "iris-header-icon clickable-icon",
-      attr: { "aria-label": "Deny importance" },
-    });
-    setIcon(denyImportanceBtn, "thumbs-down");
-    denyImportanceBtn.addEventListener("click", () => {
-      this.openDropdown(actions, ".iris-importance-dropdown", "iris-tag-dropdown iris-importance-dropdown", (dropdown) => {
-        dropdown.createDiv({ cls: "iris-tag-option-header", text: "These emails are NOT:" });
-        const levels: ImportanceClass[] = ["important", "routine", "noise"];
-        for (const oldLevel of levels) {
-          const item = dropdown.createDiv({ cls: "iris-tag-option" });
-          const icon = item.createSpan({ cls: "iris-tag-option-icon" });
-          setIcon(icon, oldLevel === "important" ? "circle-alert" : oldLevel === "noise" ? "volume-off" : "minus");
-          item.createSpan({ text: oldLevel });
-          item.addEventListener("click", () => {
-            dropdown.remove();
-            // Second dropdown: what should they be?
-            this.openDropdown(actions, ".iris-importance-dropdown", "iris-tag-dropdown iris-importance-dropdown", (dd2) => {
-              dd2.createDiv({ cls: "iris-tag-option-header", text: "They should be:" });
-              for (const newLevel of levels) {
-                if (newLevel === oldLevel) continue;
-                const item2 = dd2.createDiv({ cls: "iris-tag-option" });
-                const icon2 = item2.createSpan({ cls: "iris-tag-option-icon" });
-                setIcon(icon2, newLevel === "important" ? "circle-alert" : newLevel === "noise" ? "volume-off" : "minus");
-                item2.createSpan({ text: newLevel });
-                item2.addEventListener("click", () => {
-                  dd2.remove();
-                  this.callbacks.onBulkDenyImportance(new Set(selectedIds), oldLevel, newLevel);
-                });
-              }
-            });
-          });
-        }
-      });
-    });
-
     // Bulk deny tag: pick which tag is wrong on these emails
     if (this.tagCategories.length > 0) {
       const denyTagBtn = actions.createEl("button", {
@@ -303,6 +324,16 @@ export class MessageViewer {
       cls: "iris-viewer-header",
     });
 
+    // Compact-mode back button (visible only when list is hidden)
+    if (this.callbacks.onDismiss) {
+      const backBtn = headerEl.createEl("button", {
+        cls: "iris-viewer-compact-back clickable-icon",
+        attr: { "aria-label": "Back to list" },
+      });
+      setIcon(backBtn, "arrow-left");
+      backBtn.addEventListener("click", () => this.callbacks.onDismiss!());
+    }
+
     // Title line: subject only
     const titleLine = headerEl.createDiv({
       cls: "iris-viewer-title-line",
@@ -312,71 +343,24 @@ export class MessageViewer {
       text: (msg.subject || "").replace(/^(?:fw|fwd)\s*:\s*/i, "").trim() || "(no subject)",
     });
 
-    // Tags + importance line (combined row)
+    // Tags line
     const tagsLine = headerEl.createDiv({ cls: "iris-viewer-tags-line" });
-
-    if (this.classification) {
-      const isAuto = this.classificationSource === "auto";
-      const isObsolete = isAuto && this.classificationPromptVersion != null
-        && this.classificationPromptVersion < this.currentImportancePromptVersion;
-      const badge = tagsLine.createSpan({
-        cls: `iris-viewer-classification is-${this.classification}${isAuto ? " is-auto" : ""}${isObsolete ? " is-obsolete" : ""}`,
-        attr: {
-          title: isObsolete
-            ? `Auto-classified (v${this.classificationPromptVersion} — obsolete)`
-            : isAuto ? "Auto-classified" : "Manually classified",
-        },
-      });
-      badge.createSpan({ cls: "iris-viewer-classification-label", text: this.classification });
-      if (isAuto) {
-        const autoIcon = badge.createSpan({ cls: "iris-viewer-tag-auto-icon" });
-        setIcon(autoIcon, "sparkles");
-      }
-
-      // Click to cycle through importance levels
-      badge.addEventListener("click", (e) => {
-        e.stopPropagation();
-        this.showImportanceDropdown(tagsLine);
-      });
-
-      if (isAuto && isObsolete) {
-        const actions = badge.createSpan({ cls: "iris-viewer-tag-actions" });
-        const refreshBtn = actions.createSpan({
-          cls: "iris-viewer-tag-action",
-          attr: { "aria-label": "Re-classify with current prompt" },
-        });
-        setIcon(refreshBtn, "refresh-cw");
-        refreshBtn.addEventListener("click", (e) => {
-          e.stopPropagation();
-          if (this.currentMsg) this.callbacks.onReclassifyMessage(this.currentMsg);
-        });
-      }
-    } else if (msg.id) {
-      const classBtn = tagsLine.createEl("button", {
-        cls: "iris-viewer-classification-btn clickable-icon",
-        attr: { "aria-label": "Classify importance" },
-      });
-      setIcon(classBtn, "signal");
-      classBtn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        this.showImportanceDropdown(tagsLine);
-      });
-    }
 
     if (this.tagCategories.length > 0 && msg.id) {
       const tagEntries = this.tagCache.get(msg.id) || [];
       const activeTags = new Set(tagEntries.map((e) => e.tag));
 
       if (tagEntries.length > 0) {
+        const tagVer = (tag: string) => this.currentTagPromptVersions[tag] ?? 1;
         const hasObsoleteTag = tagEntries.some(
           (e) => e.source === "auto" && e.promptVersion != null
-            && e.promptVersion < this.currentTagPromptVersion,
+            && e.promptVersion < tagVer(e.tag),
         );
 
         for (const entry of tagEntries) {
           const isAutoTag = entry.source === "auto";
           const isObsoleteTag = isAutoTag && entry.promptVersion != null
-            && entry.promptVersion < this.currentTagPromptVersion;
+            && entry.promptVersion < tagVer(entry.tag);
           const tagBadge = tagsLine.createSpan({
             cls: `iris-viewer-tag${isAutoTag ? " is-auto" : ""}${isObsoleteTag ? " is-obsolete" : ""}`,
             attr: {
@@ -856,30 +840,6 @@ export class MessageViewer {
       }
     });
   }
-
-  private showImportanceDropdown(anchor: HTMLElement): void {
-    this.openDropdown(anchor, ".iris-importance-dropdown", "iris-tag-dropdown iris-importance-dropdown", (dropdown) => {
-      const levels: ImportanceClass[] = ["important", "routine", "noise"];
-      for (const level of levels) {
-        const isActive = this.classification === level;
-        const item = dropdown.createDiv({
-          cls: "iris-tag-option" + (isActive ? " is-selected" : ""),
-        });
-        const icon = item.createSpan({ cls: "iris-tag-option-icon" });
-        setIcon(icon, level === "important" ? "circle-alert" : level === "noise" ? "volume-off" : "minus");
-        item.createSpan({ text: level });
-        if (isActive) {
-          const check = item.createSpan({ cls: "iris-tag-option-check" });
-          setIcon(check, "check");
-        }
-        item.addEventListener("click", () => {
-          dropdown.remove();
-          if (this.currentMsg) this.callbacks.onImportanceChange(this.currentMsg, level);
-        });
-      }
-    });
-  }
-
 
   /** Create a name span with a right-click context menu to edit the nickname. */
   private createAddressSpan(

@@ -1,6 +1,8 @@
 import { App, PluginSettingTab, Setting, setIcon } from "obsidian";
 import type IrisMailPlugin from "../main";
-import { DEFAULT_CLAUDE_PROMPT, IMPORTANCE_CLASSIFY_PROMPT, TAG_CLASSIFY_PROMPT, TAG_ICON_CYCLE, ITEM_DETECTION_PROMPT, parseTagCategories } from "../constants";
+import { DEFAULT_CLAUDE_PROMPT, TAG_CLASSIFY_PROMPT, TAG_ICON_POOL, ITEM_DETECTION_PROMPT, parseTagCategories, bumpTagVersion } from "../constants";
+import { CreateTagModal } from "../views/components/CreateTagModal";
+import { generateTagDescription, hasClaudeAccess, pickTagIcon } from "../utils/claudeApi";
 import { setDebugEnabled } from "../utils/logger";
 
 export class IrisMailSettingsTab extends PluginSettingTab {
@@ -105,19 +107,6 @@ export class IrisMailSettingsTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Save folder")
-      .setDesc("Vault folder where emails are saved as notes.")
-      .addText((text) =>
-        text
-          .setPlaceholder("Emails")
-          .setValue(this.plugin.settings.saveFolderPath)
-          .onChange(async (value) => {
-            this.plugin.settings.saveFolderPath = value.trim();
-            this.plugin.scheduleSaveSettings();
-          }),
-      );
-
-    new Setting(containerEl)
       .setName("Messages per page")
       .addDropdown((dropdown) =>
         dropdown
@@ -163,12 +152,11 @@ export class IrisMailSettingsTab extends PluginSettingTab {
           .addOptions({
             off: "Off",
             unread: "Unread count",
-            important: "Important unread",
             total: "Total messages",
           })
           .setValue(this.plugin.settings.badgeCount)
           .onChange(async (value) => {
-            this.plugin.settings.badgeCount = value as "off" | "unread" | "important" | "total";
+            this.plugin.settings.badgeCount = value as "off" | "unread" | "total";
             this.plugin.scheduleSaveSettings();
             this.plugin.updateBadge(-1); // signal a re-sync
           }),
@@ -260,29 +248,6 @@ export class IrisMailSettingsTab extends PluginSettingTab {
         });
 
       new Setting(containerEl)
-        .setName("Importance classification prompt")
-        .setDesc(
-          "Instructions for importance classification. Refined automatically when you deny a classification. Leave blank to use the default.",
-        )
-        .addTextArea((textArea) => {
-          textArea.inputEl.rows = 5;
-          textArea.inputEl.style.width = "100%";
-          textArea.inputEl.placeholder = IMPORTANCE_CLASSIFY_PROMPT;
-          textArea
-            .setValue(this.plugin.settings.importanceClassifyPrompt)
-            .onChange(async (value) => {
-              this.plugin.settings.importanceClassifyPrompt = value.trim();
-              this.plugin.scheduleSaveSettings();
-            });
-        })
-        .addButton((btn) =>
-          btn.setButtonText("Reset").onClick(async () => {
-            this.plugin.settings.importanceClassifyPrompt = "";
-            this.plugin.scheduleSaveSettings();
-            this.display();
-          }),
-        );
-      new Setting(containerEl)
         .setName("Prefetch limit")
         .setDesc(
           "How many messages to pre-process with Claude in the background when the inbox loads. " +
@@ -370,55 +335,117 @@ export class IrisMailSettingsTab extends PluginSettingTab {
     // Tag Classification section
     containerEl.createEl("h3", { text: "Tag Classification" });
 
+    // Show each defined tag with its icon and definition, plus an "Add tag" button
+    const categories = parseTagCategories(this.plugin.settings.tagCategories);
+    if (!this.plugin.settings.tagIcons) this.plugin.settings.tagIcons = {};
+    if (!this.plugin.settings.tagDescriptions) this.plugin.settings.tagDescriptions = {};
+
     new Setting(containerEl)
-      .setName("Tag categories")
-      .setDesc(
-        "Comma-separated list of tags. Click an icon to change it.",
-      )
-      .addText((text) =>
-        text
-          .setPlaceholder("Finance, HR, IT, Projects, Meetings")
-          .setValue(this.plugin.settings.tagCategories)
-          .onChange(async (value) => {
-            this.plugin.settings.tagCategories = value;
-            this.plugin.scheduleSaveSettings();
-            this.display();
+      .setName("Tags")
+      .setDesc("Each tag has a name, icon, and description used by the yes/no classifier.")
+      .addButton((btn) =>
+        btn
+          .setButtonText("Add tag")
+          .setCta()
+          .onClick(() => {
+            const s = this.plugin.settings;
+            const canGenerate = s.enableClaudeProcessing && hasClaudeAccess(s.anthropicApiKey);
+            new CreateTagModal(this.app, {
+              existingTags: parseTagCategories(s.tagCategories),
+              onGenerate: canGenerate
+                ? (name) => generateTagDescription(
+                    s.anthropicApiKey,
+                    s.claudeModel,
+                    name,
+                    parseTagCategories(s.tagCategories).map((n) => ({
+                      name: n,
+                      description: s.tagDescriptions?.[n] || "",
+                    })),
+                  )
+                : undefined,
+              onSubmit: async (name, criteria, icon, iconExplicit) => {
+                const updated = [...parseTagCategories(s.tagCategories), name];
+                s.tagCategories = updated.join(", ");
+                s.tagDescriptions[name] = criteria;
+
+                const usedIcons = Object.values(s.tagIcons);
+                s.tagIcons[name] = icon;
+                this.plugin.scheduleSaveSettings();
+                this.display();
+
+                if (!iconExplicit && canGenerate) {
+                  try {
+                    const picked = await pickTagIcon(
+                      s.anthropicApiKey, s.claudeModel, name, criteria,
+                      TAG_ICON_POOL, usedIcons,
+                    );
+                    if (picked) {
+                      s.tagIcons[name] = picked;
+                      this.plugin.scheduleSaveSettings();
+                      this.display();
+                    }
+                  } catch {
+                    // Keep fallback.
+                  }
+                }
+              },
+            }).open();
           }),
       );
 
-    // Show each defined tag with its icon
-    const categories = parseTagCategories(this.plugin.settings.tagCategories);
     if (categories.length > 0) {
-      if (!this.plugin.settings.tagIcons) this.plugin.settings.tagIcons = {};
       const tagListEl = containerEl.createDiv({ cls: "iris-settings-tag-list" });
       for (const cat of categories) {
-        // Auto-assign icon if missing
         if (!this.plugin.settings.tagIcons[cat]) {
-          const usedIcons = new Set(Object.values(this.plugin.settings.tagIcons));
-          this.plugin.settings.tagIcons[cat] =
-            TAG_ICON_CYCLE.find((i) => !usedIcons.has(i)) ||
-            TAG_ICON_CYCLE[categories.indexOf(cat) % TAG_ICON_CYCLE.length];
+          this.plugin.settings.tagIcons[cat] = "tag";
         }
 
-        const tagEl = tagListEl.createDiv({ cls: "iris-settings-tag-item" });
-        const iconBtn = tagEl.createEl("button", {
-          cls: "iris-settings-tag-icon clickable-icon",
-          attr: { "aria-label": "Change icon" },
+        const needsCriteria = !(this.plugin.settings.tagDescriptions[cat] || "").trim();
+        const tagEl = tagListEl.createDiv({
+          cls: "iris-settings-tag-item is-clickable" + (needsCriteria ? " needs-description" : ""),
+          attr: { role: "button", tabindex: "0", "aria-label": `Edit tag "${cat}"` },
         });
-        setIcon(iconBtn, this.plugin.settings.tagIcons[cat]);
-        tagEl.createSpan({ text: cat });
 
-        iconBtn.addEventListener("click", async () => {
-          const current = this.plugin.settings.tagIcons[cat];
-          const idx = TAG_ICON_CYCLE.indexOf(current);
-          this.plugin.settings.tagIcons[cat] =
-            TAG_ICON_CYCLE[(idx + 1) % TAG_ICON_CYCLE.length];
+        const iconEl = tagEl.createSpan({ cls: "iris-settings-tag-icon" });
+        setIcon(iconEl, this.plugin.settings.tagIcons[cat]);
+        tagEl.createSpan({ text: cat, cls: "iris-settings-tag-name" });
+
+        if (needsCriteria) {
+          const warn = tagEl.createSpan({
+            cls: "iris-settings-tag-warn",
+            attr: { "aria-label": "Missing criteria — classifier accuracy will suffer" },
+          });
+          setIcon(warn, "alert-triangle");
+        }
+
+        const deleteBtn = tagEl.createEl("button", {
+          cls: "iris-settings-tag-delete clickable-icon",
+          attr: { "aria-label": `Delete tag "${cat}"` },
+        });
+        setIcon(deleteBtn, "trash-2");
+        deleteBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          const remaining = parseTagCategories(this.plugin.settings.tagCategories)
+            .filter((n) => n !== cat);
+          this.plugin.settings.tagCategories = remaining.join(", ");
+          delete this.plugin.settings.tagIcons[cat];
+          delete this.plugin.settings.tagDescriptions[cat];
+          if (this.plugin.settings.tagPromptVersions) {
+            delete this.plugin.settings.tagPromptVersions[cat];
+          }
           this.plugin.scheduleSaveSettings();
           this.display();
         });
+
+        const openEdit = () => this.openTagEditModal(cat);
+        tagEl.addEventListener("click", openEdit);
+        tagEl.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            openEdit();
+          }
+        });
       }
-      // Save any auto-assigned icons
-      this.plugin.scheduleSaveSettings();
     }
 
     new Setting(containerEl)
@@ -438,7 +465,7 @@ export class IrisMailSettingsTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Tag classification prompt")
       .setDesc(
-        "Instructions for tag classification. Refined automatically when you deny tags. Leave blank to use the default.",
+        "Meta-instructions for the yes/no classifier. Each tag is evaluated separately against its own definition. Refined automatically when you deny tags. Leave blank to use the default.",
       )
       .addTextArea((textArea) => {
         textArea.inputEl.rows = 5;
@@ -520,5 +547,37 @@ export class IrisMailSettingsTab extends PluginSettingTab {
             this.plugin.scheduleSaveSettings();
           }),
       );
+  }
+
+  private openTagEditModal(cat: string): void {
+    const s = this.plugin.settings;
+    const canGenerate = s.enableClaudeProcessing && hasClaudeAccess(s.anthropicApiKey);
+    new CreateTagModal(this.app, {
+      existingTags: parseTagCategories(s.tagCategories),
+      initial: {
+        name: cat,
+        criteria: s.tagDescriptions?.[cat] || "",
+        icon: s.tagIcons?.[cat] || "tag",
+      },
+      onGenerate: canGenerate
+        ? (name) => generateTagDescription(
+            s.anthropicApiKey, s.claudeModel, name,
+            parseTagCategories(s.tagCategories)
+              .filter((n) => n !== cat)
+              .map((n) => ({ name: n, description: s.tagDescriptions?.[n] || "" })),
+          )
+        : undefined,
+      onSubmit: (_name, criteria, icon) => {
+        const criteriaChanged = (s.tagDescriptions[cat] || "") !== criteria;
+        s.tagDescriptions[cat] = criteria;
+        s.tagIcons[cat] = icon;
+        if (criteriaChanged) {
+          if (!s.tagPromptVersions) s.tagPromptVersions = {};
+          bumpTagVersion(s.tagPromptVersions, cat);
+        }
+        this.plugin.scheduleSaveSettings();
+        this.display();
+      },
+    }).open();
   }
 }

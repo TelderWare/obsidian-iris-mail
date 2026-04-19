@@ -12,7 +12,6 @@ export const DEFAULT_SETTINGS: IrisMailSettings = {
   authMethod: "auth-code",
   redirectPort: 3847,
   refreshIntervalMinutes: 5,
-  saveFolderPath: "Emails",
   pageSize: 25,
   showReadEmails: true,
   badgeCount: "unread",
@@ -23,37 +22,37 @@ export const DEFAULT_SETTINGS: IrisMailSettings = {
   claudeSystemPrompt: "",
   tagCategories: "",
   tagIcons: {},
+  tagDescriptions: {},
   enableAutoTagging: true,
   tagClassifyPrompt: "",
-  tagPromptVersion: 1,
-  importanceClassifyPrompt: "",
-  importancePromptVersion: 1,
+  tagPromptVersions: {},
   prefetchLimit: 10,
   resolveForwardedSender: false,
   enableAutoItemDetection: true,
   eventNoteFolderPath: "Events",
   taskNoteFolderPath: "Tasks",
   itemDetectionPrompt: "",
-  viewMode: "senders",
+  viewMode: "messages",
   sortNewestFirst: true,
   filterUnreadOnly: true,
-  filterHideNoise: true,
-  filterImportantOnly: false,
   debugLogging: false,
 };
 
-export const IMPORTANCE_CLASSIFY_PROMPT =
-  "Classify this email as: important, routine, or noise.\n" +
-  "important — requires attention, action, or contains personally relevant information\n" +
-  "routine — informational, no action needed\n" +
-  "noise — marketing, automated, newsletters, or zero-value content\n" +
-  "Return only the single word.";
-
 export const NICKNAME_PROMPT =
-  "Convert the raw email display name into a clean, natural person name.\n" +
+  "Convert a raw email sender into a clean, natural name. The sender may be a person or an organization.\n" +
+  "Input is two lines: the raw display name, then the email address.\n" +
   "Fix casing, reorder surname-first formats, and strip codes or parenthetical tags.\n" +
-  "If the input is already a clean name, return it unchanged.\n" +
+  "Use the email address as a hint when the display name is ambiguous or missing.\n" +
+  "If the input is already clean, return it unchanged.\n" +
   "Return only the name, nothing else.";
+
+export const NICKNAME_BATCH_PROMPT =
+  "Convert each raw email sender into a clean, natural name. Senders may be people or organizations.\n" +
+  "Input is a numbered list. Each line is: N. <raw display name> | <email address>\n" +
+  "Fix casing, reorder surname-first formats, and strip codes or parenthetical tags.\n" +
+  "Use the email address as a hint when the display name is ambiguous or missing.\n" +
+  "Output one line per input, in the same order, formatted exactly: N. <clean name>\n" +
+  "Output only the numbered list, nothing else.";
 
 export const DEFAULT_CLAUDE_PROMPT =
   "You are an information extraction engine. Input is raw HTML email. Output is clean Markdown.\n\n" +
@@ -63,6 +62,7 @@ export const DEFAULT_CLAUDE_PROMPT =
   "Email metadata (sender, recipient, date, subject) is shown separately — do not include it.\n\n" +
   "Output a flat bullet-point list. " +
   "Preserve names, numbers, dates exactly. " +
+  "Convert URLs to markdown links with short descriptive text, e.g. [View invoice](https://...). " +
   "If no substantive content, return only: No substantive content.";
 
 export const MESSAGE_LIST_SELECT = [
@@ -76,7 +76,6 @@ export const MESSAGE_LIST_SELECT = [
   "isDraft",
   "hasAttachments",
   "importance",
-  "conversationId",
   "flag",
 ].join(",");
 
@@ -89,30 +88,29 @@ export const WELL_KNOWN_FOLDERS = [
   "Archive",
 ];
 
-export const TAG_ICON_CYCLE = [
-  "bookmark",
-  "flag",
-  "star",
-  "zap",
-  "briefcase",
-  "folder",
-  "heart",
-  "flame",
-  "shield",
-  "circle-dot",
-  "hash",
-  "gem",
+/** Curated Lucide icon pool. Used as the fallback seed when Claude is unavailable
+ *  and as the candidate list when Claude picks an icon for a new tag. */
+export const TAG_ICON_POOL = [
+  "bookmark", "flag", "star", "zap", "briefcase", "folder", "heart", "flame",
+  "shield", "circle-dot", "hash", "gem", "banknote", "credit-card", "wallet",
+  "receipt", "graduation-cap", "book", "book-open", "library", "school",
+  "users", "user", "building", "building-2", "home", "hospital", "stethoscope",
+  "pill", "plane", "car", "train", "ship", "map", "map-pin", "globe",
+  "calendar", "clock", "bell", "megaphone", "newspaper", "mail",
+  "message-square", "phone", "video", "camera", "image", "music",
+  "shopping-cart", "shopping-bag", "package", "truck", "utensils",
+  "coffee", "gift", "wrench", "cog", "laptop", "code", "cpu", "database",
+  "server", "cloud", "leaf", "tree-pine", "paw-print", "dumbbell",
+  "trophy", "target", "lightbulb", "key", "lock",
 ];
 
 export const TAG_CLASSIFY_PROMPT =
-  "You are an email tag classifier. Given an email and a list of tag categories, " +
-  "return the tags that apply to this email.\n\n" +
+  "You are an email tag classifier. You are given a single tag (with an optional definition) and an email. " +
+  "Decide whether the tag applies to this email.\n\n" +
   "Rules:\n" +
-  "- Return ONLY a JSON array of strings, e.g. [\"Finance\", \"Projects\"]\n" +
-  "- Only use tags from the provided list\n" +
-  "- Return an empty array [] if no tags clearly apply\n" +
-  "- Assign 1-3 tags maximum\n" +
-  "- Be conservative — only assign tags you are confident about";
+  "- Answer with a single word: yes or no\n" +
+  "- Consider the tag name and definition carefully\n" +
+  "- Be conservative — answer yes only if you are confident the tag applies";
 
 export const ITEM_DETECTION_PROMPT =
   "You scan emails for calendar events and actionable tasks.\n" +
@@ -140,4 +138,16 @@ export const CACHE_STORAGE_KEY = "iris-mail-msal-cache";
 export function parseTagCategories(raw: string): string[] {
   if (!raw) return [];
   return raw.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+/** Current prompt version for a tag — defaults to 1 so legacy entries match. */
+export function getTagVersion(versions: Record<string, number> | undefined, tag: string): number {
+  return versions?.[tag] ?? 1;
+}
+
+/** Increment a tag's version in-place and return the new value. */
+export function bumpTagVersion(versions: Record<string, number>, tag: string): number {
+  const next = getTagVersion(versions, tag) + 1;
+  versions[tag] = next;
+  return next;
 }
