@@ -64,10 +64,20 @@ export interface IrisMailSettings {
   tagCategories: string;
   /** Map of tag name → Lucide icon name. */
   tagIcons: Record<string, string>;
+  /** Map of tag name → hex color applied to the tag icon and viewer badge. Unset = default theme color. */
+  tagColors: Record<string, string>;
+  /** Map of tag name → true when the tag badge should not appear on message list rows. */
+  tagHiddenInList: Record<string, boolean>;
+  /** Map of tag name → list of tag names it contradicts (mutually exclusive). Always stored symmetrically. */
+  tagContradictions: Record<string, string[]>;
+  /** Map of tag name → list of tag names it precludes (directional: if this tag fires, skip those). */
+  tagPrecludes: Record<string, string[]>;
   /** Map of tag name → plain-English definition used for yes/no classification. */
   tagDescriptions: Record<string, string>;
   /** Whether auto-tagging via Claude is enabled. */
   enableAutoTagging: boolean;
+  /** Max unread messages to auto-tag per inbox load. 0 = disabled, -1 = all. */
+  autoTagLimit: number;
   /** Custom tag classification prompt (overrides default). */
   tagClassifyPrompt: string;
   /** Per-tag prompt version — incremented when the tag's definition or the meta-prompt changes. */

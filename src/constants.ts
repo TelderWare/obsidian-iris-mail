@@ -23,8 +23,13 @@ export const DEFAULT_SETTINGS: IrisMailSettings = {
   claudeSystemPrompt: "",
   tagCategories: "",
   tagIcons: {},
+  tagColors: {},
+  tagHiddenInList: {},
+  tagContradictions: {},
+  tagPrecludes: {},
   tagDescriptions: {},
   enableAutoTagging: true,
+  autoTagLimit: 10,
   tagClassifyPrompt: "",
   tagPromptVersions: {},
   prefetchLimit: 10,
@@ -106,12 +111,12 @@ export const TAG_ICON_POOL = [
 ];
 
 export const TAG_CLASSIFY_PROMPT =
-  "You are an email tag classifier. You are given a single tag (with an optional definition) and an email. " +
-  "Decide whether the tag applies to this email.\n\n" +
+  "You are an email tag classifier. You are given a tag definition and an email. " +
+  "Decide whether the email matches the definition.\n\n" +
   "Rules:\n" +
   "- Answer with a single word: yes or no\n" +
-  "- Consider the tag name and definition carefully\n" +
-  "- Be conservative — answer yes only if you are confident the tag applies";
+  "- If the definition is empty or ambiguous, answer no\n" +
+  "- Be conservative — answer yes only if you are confident the definition applies";
 
 export const ITEM_DETECTION_PROMPT =
   "You scan emails for calendar events and actionable tasks.\n" +
@@ -151,4 +156,123 @@ export function bumpTagVersion(versions: Record<string, number>, tag: string): n
   const next = getTagVersion(versions, tag) + 1;
   versions[tag] = next;
   return next;
+}
+
+/**
+ * Overwrite `tag`'s contradictions with `nextList` and keep the store symmetric.
+ * Adds `tag` to every new partner's list; removes `tag` from every dropped partner.
+ * Mutates `map` in place.
+ */
+export function setTagContradictions(
+  map: Record<string, string[]>,
+  tag: string,
+  nextList: string[],
+): void {
+  const prev = new Set(map[tag] || []);
+  const next = new Set(nextList);
+  if (next.size === 0) {
+    delete map[tag];
+  } else {
+    map[tag] = Array.from(next);
+  }
+  // Partners newly added: add `tag` to their lists.
+  for (const partner of next) {
+    if (prev.has(partner)) continue;
+    const partnerList = new Set(map[partner] || []);
+    partnerList.add(tag);
+    map[partner] = Array.from(partnerList);
+  }
+  // Partners dropped: remove `tag` from their lists.
+  for (const partner of prev) {
+    if (next.has(partner)) continue;
+    const partnerList = (map[partner] || []).filter((t) => t !== tag);
+    if (partnerList.length === 0) {
+      delete map[partner];
+    } else {
+      map[partner] = partnerList;
+    }
+  }
+}
+
+/** Remove a tag entirely from the contradictions map (both keys and referenced lists). */
+export function removeTagFromContradictions(
+  map: Record<string, string[]>,
+  tag: string,
+): void {
+  setTagContradictions(map, tag, []);
+}
+
+/** Overwrite `tag`'s own precludes list. Directional — does not touch any other tag's entry. */
+export function setTagPrecludesList(
+  map: Record<string, string[]>,
+  tag: string,
+  nextList: string[],
+): void {
+  const deduped = Array.from(new Set(nextList));
+  if (deduped.length === 0) {
+    delete map[tag];
+  } else {
+    map[tag] = deduped;
+  }
+}
+
+/**
+ * Return the set of tag names whose precludes list contains `tag` — i.e., tags that
+ * preclude this one. Derived view; not stored.
+ */
+export function getPrecludedBy(
+  map: Record<string, string[]>,
+  tag: string,
+): string[] {
+  const result: string[] = [];
+  for (const [other, list] of Object.entries(map)) {
+    if (other === tag) continue;
+    if ((list || []).includes(tag)) result.push(other);
+  }
+  return result;
+}
+
+/**
+ * Update which tags preclude `tag` by editing each other tag's precludes list.
+ * Adds `tag` to newly-selected tags' lists; removes from unselected ones.
+ * Mutates `map` in place.
+ */
+export function setPrecludedByFor(
+  map: Record<string, string[]>,
+  tag: string,
+  nextList: string[],
+): void {
+  const prev = new Set(getPrecludedBy(map, tag));
+  const next = new Set(nextList);
+  for (const other of next) {
+    if (prev.has(other)) continue;
+    const list = new Set(map[other] || []);
+    list.add(tag);
+    map[other] = Array.from(list);
+  }
+  for (const other of prev) {
+    if (next.has(other)) continue;
+    const list = (map[other] || []).filter((t) => t !== tag);
+    if (list.length === 0) {
+      delete map[other];
+    } else {
+      map[other] = list;
+    }
+  }
+}
+
+/** Remove a tag entirely from a precludes map (both its own entry and references to it). */
+export function removeTagFromPrecludes(
+  map: Record<string, string[]>,
+  tag: string,
+): void {
+  delete map[tag];
+  for (const other of Object.keys(map)) {
+    const list = (map[other] || []).filter((t) => t !== tag);
+    if (list.length === 0) {
+      delete map[other];
+    } else {
+      map[other] = list;
+    }
+  }
 }

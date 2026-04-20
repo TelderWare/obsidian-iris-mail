@@ -1,5 +1,6 @@
 import { Menu, setIcon } from "obsidian";
 import type { Message, SenderGroup } from "../../types";
+import type { TagCacheEntry } from "../../store/types";
 import { formatRelativeDate } from "../../utils/dateFormat";
 import { getEnvelopeSender } from "../../utils/envelopeSender";
 
@@ -130,7 +131,11 @@ export class MessageList {
   private resolveEffectiveSender: EffectiveSenderResolver | null;
   private selectedMessageId: string | null = null;
   /** Row refs keyed by messageId (or senderGroupKey for sender list) for surgical DOM updates. */
-  private rowRefs = new Map<string, { el: HTMLElement; messages: Message[] }>();
+  private rowRefs = new Map<string, { el: HTMLElement; messages: Message[]; tagSlot?: HTMLElement }>();
+  private tagCache = new Map<string, TagCacheEntry[]>();
+  private tagIcons = new Map<string, string>();
+  private tagColors = new Map<string, string>();
+  private hiddenListTags = new Set<string>();
 
   // Multi-selection state
   private selectedIds: Set<string> = new Set();
@@ -156,6 +161,51 @@ export class MessageList {
 
   setEffectiveSenderResolver(resolver: EffectiveSenderResolver | null): void {
     this.resolveEffectiveSender = resolver;
+  }
+
+  setTagCache(cache: Map<string, TagCacheEntry[]>): void {
+    this.tagCache = cache;
+  }
+
+  setTagIcons(icons: Map<string, string>): void {
+    this.tagIcons = icons;
+  }
+
+  setTagColors(colors: Map<string, string>): void {
+    this.tagColors = colors;
+  }
+
+  setHiddenListTags(hidden: Set<string>): void {
+    this.hiddenListTags = hidden;
+  }
+
+  /** Fill the provided top-left slot with a tag badge for the message (if any non-hidden tags). */
+  private renderTagSlot(slot: HTMLElement, msg: Message): void {
+    slot.empty();
+    if (!msg.id) return;
+    const entries = this.tagCache.get(msg.id);
+    if (!entries || entries.length === 0) return;
+    const visible = entries.filter((e) => !this.hiddenListTags.has(e.tag));
+    if (visible.length === 0) return;
+    const first = visible[0];
+    const iconName = this.tagIcons.get(first.tag) || "tag";
+    const badge = slot.createSpan({
+      cls: "iris-msg-tag-badge",
+      attr: { title: visible.map((e) => e.tag).join(", ") },
+    });
+    const color = this.tagColors.get(first.tag);
+    if (color) badge.style.color = color;
+    setIcon(badge, iconName);
+  }
+
+  /** Update tag badges on existing rows without rebuilding the list. */
+  refreshTagBadges(): void {
+    for (const ref of this.rowRefs.values()) {
+      if (!ref.tagSlot) continue;
+      const msg = ref.messages[0];
+      if (!msg) continue;
+      this.renderTagSlot(ref.tagSlot, msg);
+    }
   }
 
   /** Create a name span with a right-click context menu to edit the nickname. */
@@ -334,6 +384,10 @@ export class MessageList {
             : ""),
       });
 
+      // Top-left slot: tag badge (when message has tags)
+      const tagSlot = row.createDiv({ cls: "iris-msg-slot-tag" });
+      this.renderTagSlot(tagSlot, msg);
+
       // Row 1: sender name (+ optional account chip when multiple accounts)
       const nameEl = row.createDiv({ cls: "iris-msg-sender-name" });
       this.renderSenderName(nameEl, msg);
@@ -361,7 +415,7 @@ export class MessageList {
         text: parts.join(" · "),
       });
 
-      this.rowRefs.set(msgId, { el: row, messages: [msg] });
+      this.rowRefs.set(msgId, { el: row, messages: [msg], tagSlot });
       this.renderedOrder.push(msgId);
 
       row.addEventListener("click", (e: MouseEvent) => {
@@ -444,6 +498,10 @@ export class MessageList {
             : ""),
       });
 
+      // Top-left slot: tag badge (when message has tags)
+      const tagSlot = row.createDiv({ cls: "iris-msg-slot-tag" });
+      this.renderTagSlot(tagSlot, msg);
+
       row.createDiv({
         cls: "iris-msg-subject",
         text: cleanSubject(msg.subject || "") || "(no subject)",
@@ -462,7 +520,7 @@ export class MessageList {
           : "",
       });
 
-      this.rowRefs.set(msgId, { el: row, messages: [msg] });
+      this.rowRefs.set(msgId, { el: row, messages: [msg], tagSlot });
       this.renderedOrder.push(msgId);
 
       row.addEventListener("click", (e: MouseEvent) => {
@@ -533,6 +591,10 @@ export class MessageList {
         cls: "iris-msg-row" + (isUnread ? " is-unread" : ""),
       });
 
+      // Top-left slot: tag badge for the latest message (when tagged)
+      const tagSlot = row.createDiv({ cls: "iris-msg-slot-tag" });
+      this.renderTagSlot(tagSlot, latest);
+
       const nameEl = row.createDiv({ cls: "iris-msg-sender-name" });
       this.createAddressSpan(nameEl, sender.address, sender.name || sender.address);
 
@@ -554,7 +616,7 @@ export class MessageList {
         text: dateStr,
       });
 
-      this.rowRefs.set(sender.groupKey, { el: row, messages: sender.messages });
+      this.rowRefs.set(sender.groupKey, { el: row, messages: [latest, ...sender.messages.filter((m) => m !== latest)], tagSlot });
       this.renderedOrder.push(sender.groupKey);
 
       row.addEventListener("click", () => {

@@ -54,6 +54,7 @@ export class MessageViewer {
   private currentTagPromptVersions: Record<string, number> = {};
   private tagCategories: string[] = [];
   private tagIcons = new Map<string, string>();
+  private tagColors = new Map<string, string>();
   private tagCache = new Map<string, TagCacheEntry[]>();
   private resolveEffectiveSender: EffectiveSenderResolver | null = null;
   private detectedItems: DetectedItemEntry[] = [];
@@ -84,6 +85,10 @@ export class MessageViewer {
 
   setTagIcons(icons: Map<string, string>): void {
     this.tagIcons = icons;
+  }
+
+  setTagColors(colors: Map<string, string>): void {
+    this.tagColors = colors;
   }
 
   setTagCache(cache: Map<string, TagCacheEntry[]>): void {
@@ -307,10 +312,15 @@ export class MessageViewer {
             cls: `iris-viewer-tag${isAutoTag ? " is-auto" : ""}${isObsoleteTag ? " is-obsolete" : ""}`,
             attr: {
               title: isObsoleteTag
-                ? `Auto-tagged v${entry.promptVersion} (obsolete)`
-                : isAutoTag ? "Auto-tagged" : "Manually tagged",
+                ? `Auto-tagged v${entry.promptVersion} (obsolete) — right-click to remove`
+                : (isAutoTag ? "Auto-tagged" : "Manually tagged") + " — right-click to remove",
             },
           });
+          const tagColor = this.tagColors.get(entry.tag);
+          if (tagColor) {
+            tagBadge.style.background = tagColor;
+            tagBadge.style.color = "#fff";
+          }
           const iconName = this.tagIcons.get(entry.tag) || "tag";
           const iconSpan = tagBadge.createSpan({ cls: "iris-viewer-tag-icon" });
           setIcon(iconSpan, iconName);
@@ -319,6 +329,20 @@ export class MessageViewer {
             const autoIcon = tagBadge.createSpan({ cls: "iris-viewer-tag-auto-icon" });
             setIcon(autoIcon, "sparkles");
           }
+          tagBadge.addEventListener("contextmenu", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const menu = new Menu();
+            menu.addItem((item) =>
+              item
+                .setTitle(`Remove tag "${entry.tag}"`)
+                .setIcon("x")
+                .onClick(() => {
+                  if (this.currentMsg) this.callbacks.onTagChange(this.currentMsg, entry.tag);
+                }),
+            );
+            menu.showAtMouseEvent(e);
+          });
         }
 
         if (hasObsoleteTag) {

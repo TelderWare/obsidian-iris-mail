@@ -1,6 +1,6 @@
 import { App, PluginSettingTab, Setting, setIcon } from "obsidian";
 import type IrisMailPlugin from "../main";
-import { DEFAULT_CLAUDE_PROMPT, TAG_CLASSIFY_PROMPT, TAG_ICON_POOL, ITEM_DETECTION_PROMPT, parseTagCategories, bumpTagVersion, MSAL_AUTHORITY_DEFAULT } from "../constants";
+import { DEFAULT_CLAUDE_PROMPT, TAG_CLASSIFY_PROMPT, TAG_ICON_POOL, ITEM_DETECTION_PROMPT, parseTagCategories, bumpTagVersion, setTagContradictions, removeTagFromContradictions, setTagPrecludesList, setPrecludedByFor, getPrecludedBy, removeTagFromPrecludes, MSAL_AUTHORITY_DEFAULT } from "../constants";
 import { CreateTagModal } from "../views/components/CreateTagModal";
 import { generateTagDescription, hasClaudeAccess, pickTagIcon } from "../utils/claudeApi";
 import { setDebugEnabled } from "../utils/logger";
@@ -331,13 +331,24 @@ export class IrisMailSettingsTab extends PluginSettingTab {
                     })),
                   )
                 : undefined,
-              onSubmit: async (name, criteria, icon, iconExplicit) => {
+              onSubmit: async (name, criteria, icon, iconExplicit, color, contradicts, precludes, precludedBy) => {
                 const updated = [...parseTagCategories(s.tagCategories), name];
                 s.tagCategories = updated.join(", ");
                 s.tagDescriptions[name] = criteria;
 
                 const usedIcons = Object.values(s.tagIcons);
                 s.tagIcons[name] = icon;
+                if (!s.tagColors) s.tagColors = {};
+                if (color) {
+                  s.tagColors[name] = color;
+                } else {
+                  delete s.tagColors[name];
+                }
+                if (!s.tagContradictions) s.tagContradictions = {};
+                setTagContradictions(s.tagContradictions, name, contradicts);
+                if (!s.tagPrecludes) s.tagPrecludes = {};
+                setTagPrecludesList(s.tagPrecludes, name, precludes);
+                setPrecludedByFor(s.tagPrecludes, name, precludedBy);
                 this.plugin.scheduleSaveSettings();
                 this.display();
 
@@ -401,6 +412,12 @@ export class IrisMailSettingsTab extends PluginSettingTab {
           if (this.plugin.settings.tagPromptVersions) {
             delete this.plugin.settings.tagPromptVersions[cat];
           }
+          if (this.plugin.settings.tagContradictions) {
+            removeTagFromContradictions(this.plugin.settings.tagContradictions, cat);
+          }
+          if (this.plugin.settings.tagPrecludes) {
+            removeTagFromPrecludes(this.plugin.settings.tagPrecludes, cat);
+          }
           this.plugin.scheduleSaveSettings();
           this.display();
         });
@@ -419,7 +436,7 @@ export class IrisMailSettingsTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Auto-tag new emails")
       .setDesc(
-        "Use Claude to automatically predict tags for untagged emails.",
+        "Use Claude to automatically predict tags for untagged unread emails.",
       )
       .addToggle((toggle) =>
         toggle
@@ -427,6 +444,25 @@ export class IrisMailSettingsTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.enableAutoTagging = value;
             this.plugin.scheduleSaveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Auto-tag limit")
+      .setDesc(
+        "How many unread untagged messages to classify per inbox load. " +
+        "Set to 0 to disable, or -1 for all messages.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("10")
+          .setValue(String(this.plugin.settings.autoTagLimit))
+          .onChange(async (value) => {
+            const n = parseInt(value, 10);
+            if (!isNaN(n) && n >= -1) {
+              this.plugin.settings.autoTagLimit = n;
+              this.plugin.scheduleSaveSettings();
+            }
           }),
       );
 
@@ -723,6 +759,10 @@ export class IrisMailSettingsTab extends PluginSettingTab {
         name: cat,
         criteria: s.tagDescriptions?.[cat] || "",
         icon: s.tagIcons?.[cat] || "tag",
+        color: s.tagColors?.[cat] || "",
+        contradicts: s.tagContradictions?.[cat] || [],
+        precludes: s.tagPrecludes?.[cat] || [],
+        precludedBy: getPrecludedBy(s.tagPrecludes || {}, cat),
       },
       onGenerate: canGenerate
         ? (name) => generateTagDescription(
@@ -732,10 +772,21 @@ export class IrisMailSettingsTab extends PluginSettingTab {
               .map((n) => ({ name: n, description: s.tagDescriptions?.[n] || "" })),
           )
         : undefined,
-      onSubmit: (_name, criteria, icon) => {
+      onSubmit: (_name, criteria, icon, _iconExplicit, color, contradicts, precludes, precludedBy) => {
         const criteriaChanged = (s.tagDescriptions[cat] || "") !== criteria;
         s.tagDescriptions[cat] = criteria;
         s.tagIcons[cat] = icon;
+        if (!s.tagColors) s.tagColors = {};
+        if (color) {
+          s.tagColors[cat] = color;
+        } else {
+          delete s.tagColors[cat];
+        }
+        if (!s.tagContradictions) s.tagContradictions = {};
+        setTagContradictions(s.tagContradictions, cat, contradicts);
+        if (!s.tagPrecludes) s.tagPrecludes = {};
+        setTagPrecludesList(s.tagPrecludes, cat, precludes);
+        setPrecludedByFor(s.tagPrecludes, cat, precludedBy);
         if (criteriaChanged) {
           if (!s.tagPromptVersions) s.tagPromptVersions = {};
           bumpTagVersion(s.tagPromptVersions, cat);

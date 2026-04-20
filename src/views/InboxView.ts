@@ -11,6 +11,12 @@ import {
   parseTagCategories,
   getTagVersion,
   bumpTagVersion,
+  setTagContradictions,
+  removeTagFromContradictions,
+  setTagPrecludesList,
+  setPrecludedByFor,
+  getPrecludedBy,
+  removeTagFromPrecludes,
 } from "../constants";
 import { MessageList } from "./components/MessageList";
 import { MessageViewer } from "./components/MessageViewer";
@@ -72,6 +78,7 @@ export class InboxView extends ItemView {
   private filterWrap!: HTMLDivElement;
   private filterUnreadOnly!: boolean;
   private unreadOptBtn!: HTMLButtonElement;
+  private filterTags = new Set<string>();
 
   private selectedMessageId: string | null = null;
   private lastStrippedHtml: string = "";
@@ -342,7 +349,12 @@ export class InboxView extends ItemView {
     this.messageViewer.setEffectiveSenderResolver(effectiveSenderResolver);
     this.messageViewer.setTagCategories(this.getTagCategories());
     this.messageViewer.setTagIcons(this.getTagIconMap());
+    this.messageViewer.setTagColors(this.getTagColorMap());
     this.messageViewer.setTagCache(this.tagCache);
+    this.messageList.setTagIcons(this.getTagIconMap());
+    this.messageList.setTagColors(this.getTagColorMap());
+    this.messageList.setTagCache(this.tagCache);
+    this.messageList.setHiddenListTags(this.getHiddenListTagSet());
     this.messageViewer.setPromptVersions(
       this.plugin.settings.tagPromptVersions || {},
     );
@@ -376,6 +388,23 @@ export class InboxView extends ItemView {
   private regroupAndSync(): void {
     this.senderGroups = this.groupByEffectiveSender(this.messageState.messages);
     this.syncBadge();
+  }
+
+  /** Push the current tag cache to the viewer and refresh list row badges in place. */
+  private syncTagCacheViews(): void {
+    this.messageViewer.setTagCache(this.tagCache);
+    this.messageList.refreshTagBadges();
+  }
+
+  /** Push tag icon/color maps to both viewer and list, then refresh list badges. */
+  private syncTagMetadataViews(): void {
+    const icons = this.getTagIconMap();
+    const colors = this.getTagColorMap();
+    this.messageViewer.setTagIcons(icons);
+    this.messageViewer.setTagColors(colors);
+    this.messageList.setTagIcons(icons);
+    this.messageList.setTagColors(colors);
+    this.messageList.refreshTagBadges();
   }
 
   /** Re-render the viewer for the currently selected message. */
@@ -745,7 +774,7 @@ export class InboxView extends ItemView {
       this.tagCache.set(msgId, [...existing, entry]);
       this.plugin.store.setTag(msgId, tag, "manual");
     }
-    this.messageViewer.setTagCache(this.tagCache);
+    this.syncTagCacheViews();
     this.messageList.clearMultiSelection();
     this.messageViewer.clear();
   }
@@ -776,7 +805,7 @@ export class InboxView extends ItemView {
       }
     }
 
-    this.messageViewer.setTagCache(this.tagCache);
+    this.syncTagCacheViews();
     this.messageList.clearMultiSelection();
     this.messageViewer.clear();
 
@@ -1112,7 +1141,7 @@ export class InboxView extends ItemView {
       }
       await this.classifier.autoTagAllMessages(
         this.messageState.messages,
-        () => this.messageViewer.setTagCache(this.tagCache),
+        () => this.syncTagCacheViews(),
       );
     })().catch((err) => logger.warn("InboxView", "Auto-tagging failed", err));
 
@@ -1245,7 +1274,7 @@ export class InboxView extends ItemView {
       this.tagCache.set(msgId, [...existing, entry]);
       this.plugin.store.setTag(msgId, tag, "manual");
     }
-    if (toTag.length > 0) this.messageViewer.setTagCache(this.tagCache);
+    if (toTag.length > 0) this.syncTagCacheViews();
 
     if (toBin.length > 0) {
       const victimIds = new Set(toBin.map((m) => m.id!).filter(Boolean));
@@ -1398,13 +1427,41 @@ export class InboxView extends ItemView {
     }
   }
 
-  /** Apply active toggle filters (unread) to a message list. */
+  /** Apply active toggle filters (unread, tags) to a message list. */
   private applyMessageFilters(messages: Message[]): Message[] {
     let filtered = messages;
     if (this.filterUnreadOnly) {
       filtered = filtered.filter((m) => !m.isRead);
     }
+    if (this.filterTags.size > 0) {
+      filtered = filtered.filter((m) => {
+        if (!m.id) return false;
+        const entries = this.tagCache.get(m.id);
+        if (!entries || entries.length === 0) return false;
+        const msgTags = new Set(entries.map((e) => e.tag));
+        for (const t of this.filterTags) {
+          if (!msgTags.has(t)) return false;
+        }
+        return true;
+      });
+    }
     return filtered;
+  }
+
+  /** Toggle a tag in the active filter set and re-render. */
+  private toggleTagFilter(tag: string): void {
+    if (this.filterTags.has(tag)) {
+      this.filterTags.delete(tag);
+    } else {
+      this.filterTags.add(tag);
+    }
+    // Drop filter entries that no longer correspond to defined categories.
+    const defined = new Set(this.getTagCategories());
+    for (const t of Array.from(this.filterTags)) {
+      if (!defined.has(t)) this.filterTags.delete(t);
+    }
+    this.rebuildTagWrap();
+    this.applyFilters();
   }
 
   /** Apply active filters to a sender's message list. */
@@ -1422,19 +1479,17 @@ export class InboxView extends ItemView {
 
   // --- Private: tag classification ---
 
-  private getSelectedMessage(): Message | null {
-    if (!this.selectedMessageId) return null;
-    return (
-      this.messageState.messages.find((m) => m.id === this.selectedMessageId) ||
-      null
-    );
-  }
-
   private rebuildTagWrap(): void {
     this.tagWrap.empty();
 
     const categories = this.getTagCategories();
     const icons = this.plugin.settings.tagIcons || {};
+
+    // Drop filter entries for tags that no longer exist.
+    const defined = new Set(categories);
+    for (const t of Array.from(this.filterTags)) {
+      if (!defined.has(t)) this.filterTags.delete(t);
+    }
 
     // Lead icon (always visible)
     const leadBtn = this.tagWrap.createEl("button", {
@@ -1442,23 +1497,28 @@ export class InboxView extends ItemView {
       attr: { "aria-label": "Tags" },
     });
     setIcon(leadBtn, "tag");
+    leadBtn.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      this.openHiddenTagsMenu(e);
+    });
+
+    const colors = this.plugin.settings.tagColors || {};
 
     // One button per existing tag (hidden, revealed on hover)
     for (const cat of categories) {
       const wrap = this.tagWrap.createDiv({ cls: "iris-tag-icon-wrap" });
+      const isActive = this.filterTags.has(cat);
       const btn = wrap.createEl("button", {
-        cls: "iris-filter-opt clickable-icon",
-        attr: { "aria-label": cat },
+        cls: "iris-filter-opt clickable-icon" + (isActive ? " is-active" : ""),
+        attr: { "aria-label": `Filter: ${cat}` },
       });
+      if (colors[cat]) btn.style.color = colors[cat];
       setIcon(btn, icons[cat] || "tag");
       wrap.createSpan({ cls: "iris-tag-icon-label", text: cat });
-      btn.addEventListener("click", () => {
-        const msg = this.getSelectedMessage();
-        if (msg) this.handleTagChange(msg, cat);
-      });
+      btn.addEventListener("click", () => this.toggleTagFilter(cat));
       btn.addEventListener("contextmenu", (e) => {
         e.preventDefault();
-        this.openTagEditModal(cat);
+        this.openTagContextMenu(e, cat);
       });
     }
 
@@ -1488,18 +1548,29 @@ export class InboxView extends ItemView {
             this.getTagCandidates(),
           )
         : undefined,
-      onSubmit: async (name, criteria, icon, iconExplicit) => {
+      onSubmit: async (name, criteria, icon, iconExplicit, color, contradicts, precludes, precludedBy) => {
         const updated = [...categories, name];
         this.plugin.settings.tagCategories = updated.join(", ");
         if (!this.plugin.settings.tagIcons) this.plugin.settings.tagIcons = {};
         if (!this.plugin.settings.tagDescriptions) this.plugin.settings.tagDescriptions = {};
+        if (!this.plugin.settings.tagColors) this.plugin.settings.tagColors = {};
+        if (!this.plugin.settings.tagContradictions) this.plugin.settings.tagContradictions = {};
+        if (!this.plugin.settings.tagPrecludes) this.plugin.settings.tagPrecludes = {};
         this.plugin.settings.tagDescriptions[name] = criteria;
 
         const usedIcons = Object.values(this.plugin.settings.tagIcons);
         this.plugin.settings.tagIcons[name] = icon;
+        if (color) {
+          this.plugin.settings.tagColors[name] = color;
+        } else {
+          delete this.plugin.settings.tagColors[name];
+        }
+        setTagContradictions(this.plugin.settings.tagContradictions, name, contradicts);
+        setTagPrecludesList(this.plugin.settings.tagPrecludes, name, precludes);
+        setPrecludedByFor(this.plugin.settings.tagPrecludes, name, precludedBy);
         void this.plugin.saveSettings();
         this.messageViewer.setTagCategories(updated);
-        this.messageViewer.setTagIcons(this.getTagIconMap());
+        this.syncTagMetadataViews();
         this.rebuildTagWrap();
 
         if (!iconExplicit && canGenerate) {
@@ -1511,7 +1582,7 @@ export class InboxView extends ItemView {
             if (picked) {
               this.plugin.settings.tagIcons[name] = picked;
               void this.plugin.saveSettings();
-              this.messageViewer.setTagIcons(this.getTagIconMap());
+              this.syncTagMetadataViews();
               this.rebuildTagWrap();
             }
           } catch (err) {
@@ -1520,6 +1591,119 @@ export class InboxView extends ItemView {
         }
       },
     }).open();
+  }
+
+  private openHiddenTagsMenu(evt: MouseEvent): void {
+    const s = this.plugin.settings;
+    const hiddenMap = s.tagHiddenInList || {};
+    const hidden = this.getTagCategories().filter((c) => hiddenMap[c]);
+    const menu = new Menu();
+    if (hidden.length === 0) {
+      menu.addItem((item) => item.setTitle("No tags hidden from message lists").setDisabled(true));
+    } else {
+      for (const cat of hidden) {
+        menu.addItem((item) =>
+          item
+            .setTitle(`Show "${cat}" in message lists`)
+            .setIcon("eye")
+            .onClick(() => this.toggleTagListHidden(cat)),
+        );
+      }
+    }
+    menu.showAtMouseEvent(evt);
+  }
+
+  private openTagContextMenu(evt: MouseEvent, cat: string): void {
+    const s = this.plugin.settings;
+    const isHidden = !!s.tagHiddenInList?.[cat];
+
+    const menu = new Menu();
+
+    menu.addItem((item) =>
+      item
+        .setTitle(isHidden ? "Show in message lists" : "Hide from message lists")
+        .setIcon(isHidden ? "eye" : "eye-off")
+        .onClick(() => this.toggleTagListHidden(cat)),
+    );
+
+    menu.addSeparator();
+    menu.addItem((item) =>
+      item
+        .setTitle("Edit tag…")
+        .setIcon("pencil")
+        .onClick(() => this.openTagEditModal(cat)),
+    );
+    menu.addItem((item) =>
+      item
+        .setTitle("Delete tag")
+        .setIcon("trash-2")
+        .setWarning(true)
+        .onClick(() => this.deleteTag(cat)),
+    );
+
+    menu.showAtMouseEvent(evt);
+  }
+
+  /** Delete a tag entirely: purge settings, message entries, and refresh UI. */
+  private deleteTag(cat: string): void {
+    const affected = Array.from(this.tagCache.entries()).filter(
+      ([, entries]) => entries.some((e) => e.tag === cat),
+    );
+
+    const s = this.plugin.settings;
+
+    // Settings scalar/maps
+    const remaining = parseTagCategories(s.tagCategories).filter((n) => n !== cat);
+    s.tagCategories = remaining.join(", ");
+    if (s.tagIcons) delete s.tagIcons[cat];
+    if (s.tagDescriptions) delete s.tagDescriptions[cat];
+    if (s.tagColors) delete s.tagColors[cat];
+    if (s.tagPromptVersions) delete s.tagPromptVersions[cat];
+    if (s.tagHiddenInList) delete s.tagHiddenInList[cat];
+    if (s.tagContradictions) removeTagFromContradictions(s.tagContradictions, cat);
+    if (s.tagPrecludes) removeTagFromPrecludes(s.tagPrecludes, cat);
+
+    // In-memory and persistent per-message tag entries
+    for (const [msgId, entries] of affected) {
+      const filtered = entries.filter((e) => e.tag !== cat);
+      if (filtered.length === 0) {
+        this.tagCache.delete(msgId);
+      } else {
+        this.tagCache.set(msgId, filtered);
+      }
+      this.plugin.store.removeTag(msgId, cat);
+    }
+
+    // Active filters referencing the deleted tag
+    this.filterTags.delete(cat);
+
+    void this.plugin.saveSettings();
+    this.syncTagMetadataViews();
+    this.messageList.setHiddenListTags(this.getHiddenListTagSet());
+    this.messageViewer.setTagCategories(remaining);
+    this.syncTagCacheViews();
+    this.rebuildTagWrap();
+    this.applyFilters();
+    this.messageViewer.refresh();
+    new Notice(`Deleted tag "${cat}".`);
+  }
+
+  private toggleTagListHidden(cat: string): void {
+    const s = this.plugin.settings;
+    if (!s.tagHiddenInList) s.tagHiddenInList = {};
+    if (s.tagHiddenInList[cat]) {
+      delete s.tagHiddenInList[cat];
+    } else {
+      s.tagHiddenInList[cat] = true;
+    }
+    void this.plugin.saveSettings();
+    this.messageList.setHiddenListTags(this.getHiddenListTagSet());
+    this.messageList.refreshTagBadges();
+  }
+
+  private getHiddenListTagSet(): Set<string> {
+    const map = this.plugin.settings.tagHiddenInList || {};
+    return new Set(Object.keys(map).filter((k) => map[k]));
   }
 
   private openTagEditModal(cat: string): void {
@@ -1531,6 +1715,10 @@ export class InboxView extends ItemView {
         name: cat,
         criteria: s.tagDescriptions?.[cat] || "",
         icon: s.tagIcons?.[cat] || "tag",
+        color: s.tagColors?.[cat] || "",
+        contradicts: s.tagContradictions?.[cat] || [],
+        precludes: s.tagPrecludes?.[cat] || [],
+        precludedBy: getPrecludedBy(s.tagPrecludes || {}, cat),
       },
       onGenerate: canGenerate
         ? (name) => generateTagDescription(
@@ -1538,19 +1726,31 @@ export class InboxView extends ItemView {
             this.getTagCandidates().filter((t) => t.name !== cat),
           )
         : undefined,
-      onSubmit: (_name, criteria, icon) => {
+      onSubmit: (_name, criteria, icon, _iconExplicit, color, contradicts, precludes, precludedBy) => {
         const criteriaChanged = (s.tagDescriptions?.[cat] || "") !== criteria;
         if (!s.tagDescriptions) s.tagDescriptions = {};
         if (!s.tagIcons) s.tagIcons = {};
+        if (!s.tagColors) s.tagColors = {};
+        if (!s.tagContradictions) s.tagContradictions = {};
+        if (!s.tagPrecludes) s.tagPrecludes = {};
         s.tagDescriptions[cat] = criteria;
         s.tagIcons[cat] = icon;
+        if (color) {
+          s.tagColors[cat] = color;
+        } else {
+          delete s.tagColors[cat];
+        }
+        setTagContradictions(s.tagContradictions, cat, contradicts);
+        setTagPrecludesList(s.tagPrecludes, cat, precludes);
+        setPrecludedByFor(s.tagPrecludes, cat, precludedBy);
         if (criteriaChanged) {
           if (!s.tagPromptVersions) s.tagPromptVersions = {};
           bumpTagVersion(s.tagPromptVersions, cat);
         }
         void this.plugin.saveSettings();
-        this.messageViewer.setTagIcons(this.getTagIconMap());
+        this.syncTagMetadataViews();
         this.rebuildTagWrap();
+        this.messageViewer.refresh();
       },
     }).open();
   }
@@ -1570,6 +1770,11 @@ export class InboxView extends ItemView {
   private getTagIconMap(): Map<string, string> {
     const icons = this.plugin.settings.tagIcons || {};
     return new Map(Object.entries(icons));
+  }
+
+  private getTagColorMap(): Map<string, string> {
+    const colors = this.plugin.settings.tagColors || {};
+    return new Map(Object.entries(colors));
   }
 
   private getClassifiableContent(msg: Message): string {
@@ -1626,7 +1831,7 @@ export class InboxView extends ItemView {
       }
     }
 
-    this.messageViewer.setTagCache(this.tagCache);
+    this.syncTagCacheViews();
     this.renderSelectedMessage(msg);
 
     // Refine prompt for any removed auto-tags
@@ -2050,6 +2255,8 @@ export class InboxView extends ItemView {
         this.getEffectiveTagPrompt(),
         content,
         candidates,
+        s.tagContradictions || {},
+        s.tagPrecludes || {},
       );
 
       const newEntries: TagCacheEntry[] = tags.map((tag) => ({
@@ -2078,7 +2285,7 @@ export class InboxView extends ItemView {
       logger.warn("InboxView", "Re-tag failed", err);
     }
 
-    this.messageViewer.setTagCache(this.tagCache);
+    this.syncTagCacheViews();
     this.renderSelectedMessage(msg);
   }
 

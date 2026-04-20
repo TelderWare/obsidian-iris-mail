@@ -34,17 +34,21 @@ export class EmailClassifier {
     const s = this.getSettings();
     if (!s.enableAutoTagging || !s.enableClaudeProcessing || !hasClaudeAccess(s.anthropicApiKey)) return;
 
+    const limit = s.autoTagLimit ?? 10;
+    if (limit === 0) return;
+
     const candidates = this.getTagCandidates();
     if (candidates.length === 0) return;
 
     const untagged = messages.filter(
-      (m) => m.id && !this.tagCache.has(m.id),
+      (m) => m.id && !m.isRead && !this.tagCache.has(m.id),
     );
-    if (untagged.length === 0) return;
+    const queue = limit === -1 ? untagged : untagged.slice(0, limit);
+    if (queue.length === 0) return;
 
-    logger.debug("Classifier", `Tagging ${untagged.length} messages`);
+    logger.debug("Classifier", `Tagging ${queue.length} of ${untagged.length} unread untagged messages`);
 
-    const promises = untagged.map((msg) =>
+    const promises = queue.map((msg) =>
       this.pool.run(async () => {
         const content = this.getBestContent(msg);
         if (!content || this.tagCache.has(msg.id!)) return;
@@ -54,6 +58,8 @@ export class EmailClassifier {
             s.anthropicApiKey, s.claudeModel,
             s.tagClassifyPrompt || DEFAULT_TAG_PROMPT,
             content, candidates,
+            s.tagContradictions || {},
+            s.tagPrecludes || {},
           );
 
           if (tags.length > 0 && !this.tagCache.has(msg.id!)) {
