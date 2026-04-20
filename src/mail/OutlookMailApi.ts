@@ -1,12 +1,18 @@
 import { Client } from "@microsoft/microsoft-graph-client";
-import type { AuthProvider } from "../auth/AuthProvider";
-import type { MailFolder, Message, GraphPagedResponse } from "../types";
+import type { OutlookAuthProvider } from "../auth/OutlookAuthProvider";
+import type { MailFolder, Message } from "../types";
 import { MESSAGE_LIST_SELECT } from "../constants";
+import type { MailApi, MailListResponse, ListMessagesOptions } from "./MailApi";
 
-export class GraphMailApi {
+interface GraphPagedResponse<T> {
+  "@odata.nextLink"?: string;
+  value: T[];
+}
+
+export class OutlookMailApi implements MailApi {
   private client: Client | null = null;
 
-  constructor(private authProvider: AuthProvider) {}
+  constructor(private authProvider: OutlookAuthProvider) {}
 
   private getClient(): Client {
     if (!this.client) {
@@ -28,32 +34,33 @@ export class GraphMailApi {
 
   async listMessages(
     folderId: string,
-    options: {
-      top?: number;
-      search?: string;
-      filter?: string;
-      nextLink?: string;
-    } = {},
-  ): Promise<GraphPagedResponse<Message>> {
+    options: ListMessagesOptions = {},
+  ): Promise<MailListResponse<Message>> {
+    let response: GraphPagedResponse<Message>;
+
     if (options.nextLink) {
-      // nextLink is a full URL — pass it directly
-      return await this.getClient().api(options.nextLink).get();
+      response = await this.getClient().api(options.nextLink).get();
+    } else {
+      let request = this.getClient()
+        .api(`/me/mailFolders/${folderId}/messages`)
+        .select(MESSAGE_LIST_SELECT)
+        .orderby("receivedDateTime desc")
+        .top(options.top ?? 25);
+
+      if (options.search) {
+        request = request.search(`"${options.search}"`);
+      }
+      if (options.unreadOnly) {
+        request = request.filter("isRead eq false");
+      }
+
+      response = await request.get();
     }
 
-    let request = this.getClient()
-      .api(`/me/mailFolders/${folderId}/messages`)
-      .select(MESSAGE_LIST_SELECT)
-      .orderby("receivedDateTime desc")
-      .top(options.top ?? 25);
-
-    if (options.search) {
-      request = request.search(`"${options.search}"`);
-    }
-    if (options.filter) {
-      request = request.filter(options.filter);
-    }
-
-    return await request.get();
+    return {
+      value: response.value,
+      nextLink: response["@odata.nextLink"] ?? null,
+    };
   }
 
   async getMessage(messageId: string): Promise<Message> {
@@ -82,4 +89,9 @@ export class GraphMailApi {
       .update({ isRead: false });
   }
 
+  async deleteMessage(messageId: string): Promise<void> {
+    await this.getClient()
+      .api(`/me/messages/${messageId}/move`)
+      .post({ destinationId: "deletedItems" });
+  }
 }

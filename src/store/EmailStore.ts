@@ -25,7 +25,54 @@ const DATA_CACHE_KEY = "__cache";
 const SAVE_DEBOUNCE_MS = 2000;
 
 function emptyIndex(): EmailStoreIndex {
-  return { version: 1, bodies: {}, messageLists: {}, processed: {}, nicknames: {}, readMessages: {}, tags: {}, detectedItems: {}, itemsScanned: {}, deletedNicknames: {} };
+  return { version: 2, bodies: {}, messageLists: {}, processed: {}, nicknames: {}, readMessages: {}, tags: {}, detectedItems: {}, itemsScanned: {}, deletedNicknames: {} };
+}
+
+/** Rewrite an existing v1 (single-account, native ids) index as v2 (composite ids). */
+function migrateLegacyToComposite(legacy: Record<string, unknown>, accountId: string): EmailStoreIndex {
+  const prefix = (id: string) => `${accountId}:${id}`;
+  const remap = <T>(obj: Record<string, T> | undefined): Record<string, T> => {
+    const out: Record<string, T> = {};
+    for (const [k, v] of Object.entries(obj ?? {})) out[prefix(k)] = v;
+    return out;
+  };
+  const remapBodies = (obj: Record<string, BodyCacheEntry> | undefined): Record<string, BodyCacheEntry> => {
+    const out: Record<string, BodyCacheEntry> = {};
+    for (const [k, v] of Object.entries(obj ?? {})) {
+      const newKey = prefix(k);
+      out[newKey] = { ...v, messageId: newKey };
+    }
+    return out;
+  };
+  const remapTags = (obj: Record<string, TagCacheEntry[]> | undefined): Record<string, TagCacheEntry[]> => {
+    const out: Record<string, TagCacheEntry[]> = {};
+    for (const [k, arr] of Object.entries(obj ?? {})) {
+      const newKey = prefix(k);
+      out[newKey] = arr.map((e) => ({ ...e, messageId: newKey }));
+    }
+    return out;
+  };
+  const remapItems = (obj: Record<string, DetectedItemEntry[]> | undefined): Record<string, DetectedItemEntry[]> => {
+    const out: Record<string, DetectedItemEntry[]> = {};
+    for (const [k, arr] of Object.entries(obj ?? {})) {
+      const newKey = prefix(k);
+      out[newKey] = arr.map((e) => ({ ...e, messageId: newKey, itemId: prefix(e.itemId) }));
+    }
+    return out;
+  };
+  return {
+    version: 2,
+    bodies: remapBodies(legacy.bodies as Record<string, BodyCacheEntry>),
+    // Drop messageLists — old folder ids are no longer meaningful in unified mode.
+    messageLists: {},
+    processed: remap(legacy.processed as Record<string, ProcessedCacheEntry>),
+    nicknames: (legacy.nicknames as EmailStoreIndex["nicknames"]) ?? {},
+    readMessages: remap(legacy.readMessages as Record<string, number>),
+    tags: remapTags(legacy.tags as Record<string, TagCacheEntry[]>),
+    detectedItems: remapItems(legacy.detectedItems as Record<string, DetectedItemEntry[]>),
+    itemsScanned: remap(legacy.itemsScanned as Record<string, number>),
+    deletedNicknames: (legacy.deletedNicknames as Record<string, number>) ?? {},
+  };
 }
 
 export class EmailStore {
@@ -47,15 +94,36 @@ export class EmailStore {
     try {
       const data = (await this.plugin.loadData()) ?? {};
       const cached = data[DATA_CACHE_KEY];
-      if (cached?.version === 1) {
+      if (cached?.version === 2) {
         this.index = { ...emptyIndex(), ...cached } as EmailStoreIndex;
         this.migrateTags();
         return;
       }
+      if (cached?.version === 1) {
+        const accountId = this.firstAccountId();
+        if (accountId) {
+          this.index = migrateLegacyToComposite(cached as Record<string, unknown>, accountId);
+          this.migrateTags();
+          await this.save();
+          logger.info("Store", `Migrated v1 cache to composite ids under account ${accountId}`);
+        } else {
+          // No account to attribute legacy data to — drop and start fresh.
+          this.index = emptyIndex();
+          await this.save();
+          logger.warn("Store", "v1 cache dropped: no account exists to migrate it under");
+        }
+        return;
+      }
 
-      // Migrate legacy cache files into data.json
+      // Migrate legacy file-based cache into data.json (then composite-migrate).
       const migrated = await this.migrateLegacyCache();
       if (migrated) {
+        const accountId = this.firstAccountId();
+        if (accountId) {
+          this.index = migrateLegacyToComposite(this.index as unknown as Record<string, unknown>, accountId);
+        } else {
+          this.index = emptyIndex();
+        }
         this.migrateTags();
         await this.save();
       }
@@ -63,6 +131,11 @@ export class EmailStore {
       logger.warn("Store", "Failed to load cache, starting fresh", err);
       this.index = emptyIndex();
     }
+  }
+
+  private firstAccountId(): string | undefined {
+    const settings = (this.plugin as unknown as { settings?: { accounts?: Array<{ id: string }> } }).settings;
+    return settings?.accounts?.[0]?.id;
   }
 
   private async migrateLegacyCache(): Promise<boolean> {

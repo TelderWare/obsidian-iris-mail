@@ -1,9 +1,12 @@
 import { App, PluginSettingTab, Setting, setIcon } from "obsidian";
 import type IrisMailPlugin from "../main";
-import { DEFAULT_CLAUDE_PROMPT, TAG_CLASSIFY_PROMPT, TAG_ICON_POOL, ITEM_DETECTION_PROMPT, parseTagCategories, bumpTagVersion } from "../constants";
+import { DEFAULT_CLAUDE_PROMPT, TAG_CLASSIFY_PROMPT, TAG_ICON_POOL, ITEM_DETECTION_PROMPT, parseTagCategories, bumpTagVersion, MSAL_AUTHORITY_DEFAULT } from "../constants";
 import { CreateTagModal } from "../views/components/CreateTagModal";
 import { generateTagDescription, hasClaudeAccess, pickTagIcon } from "../utils/claudeApi";
 import { setDebugEnabled } from "../utils/logger";
+import { ImapAuthProvider } from "../auth/ImapAuthProvider";
+import { IMAP_PRESETS, getImapPreset } from "../mail/imapPresets";
+import type { Account, MailProvider, AuthMethod } from "../types";
 
 export class IrisMailSettingsTab extends PluginSettingTab {
   plugin: IrisMailPlugin;
@@ -19,76 +22,47 @@ export class IrisMailSettingsTab extends PluginSettingTab {
 
     containerEl.createEl("h2", { text: "Iris Mail Settings" });
 
-    new Setting(containerEl)
-      .setName("Azure Client ID")
-      .setDesc(
-        "Application (client) ID from your Azure Entra app registration. " +
-          "Register at portal.azure.com > App registrations > New registration. " +
-          "Set platform to 'Public client' with redirect URI http://localhost:{port}/redirect.",
-      )
-      .addText((text) =>
-        text
-          .setPlaceholder("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
-          .setValue(this.plugin.settings.clientId)
-          .onChange(async (value) => {
-            this.plugin.settings.clientId = value.trim();
-            this.plugin.scheduleSaveSettings();
-          }),
-      );
+    // ── Accounts ────────────────────────────────────────
+    containerEl.createEl("h3", { text: "Accounts" });
 
-    new Setting(containerEl)
-      .setName("Authority")
-      .setDesc(
-        "Azure authority URL. Use 'common' for any account, or your tenant ID for org-only.",
-      )
-      .addText((text) =>
-        text
-          .setPlaceholder("https://login.microsoftonline.com/common")
-          .setValue(this.plugin.settings.authority)
-          .onChange(async (value) => {
-            this.plugin.settings.authority = value.trim();
-            this.plugin.scheduleSaveSettings();
-          }),
-      );
-
-    new Setting(containerEl)
-      .setName("Sign-in method")
-      .setDesc(
-        "Browser redirect opens a browser window. Device code lets you sign in on any device.",
-      )
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOptions({
-            "auth-code": "Browser redirect",
-            "device-code": "Device code",
-          })
-          .setValue(this.plugin.settings.authMethod)
-          .onChange(async (value) => {
-            this.plugin.settings.authMethod = value as "auth-code" | "device-code";
-            this.plugin.scheduleSaveSettings();
-            this.display(); // re-render to show/hide redirect port
-          }),
-      );
-
-    if (this.plugin.settings.authMethod === "auth-code") {
-      new Setting(containerEl)
-        .setName("Redirect port")
-        .setDesc(
-          "Localhost port for OAuth redirect. Must match the redirect URI in your Azure app.",
-        )
-        .addText((text) =>
-          text
-            .setPlaceholder("3847")
-            .setValue(String(this.plugin.settings.redirectPort))
-            .onChange(async (value) => {
-              const port = parseInt(value, 10);
-              if (!isNaN(port) && port > 0 && port <= 65535) {
-                this.plugin.settings.redirectPort = port;
-                this.plugin.scheduleSaveSettings();
-              }
-            }),
-        );
+    for (const account of this.plugin.settings.accounts) {
+      this.renderAccount(containerEl, account);
     }
+
+    new Setting(containerEl)
+      .setName("Add account")
+      .setDesc("Connect via Azure (OAuth) for Outlook, or via IMAP for any provider that supports app passwords.")
+      .addButton((btn) =>
+        btn.setButtonText("Via Azure").onClick(async () => {
+          await this.plugin.createAccount({ label: "Outlook", provider: "outlook" });
+          this.display();
+        }),
+      )
+      .addButton((btn) =>
+        btn.setButtonText("Via IMAP").onClick(async () => {
+          await this.plugin.createAccount({ label: "IMAP", provider: "imap" });
+          this.display();
+        }),
+      );
+
+    // Shared OAuth port for both providers' loopback redirect.
+    new Setting(containerEl)
+      .setName("Redirect port")
+      .setDesc(
+        "Localhost port for OAuth redirect. Must match the redirect URI registered in your Azure app.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("3847")
+          .setValue(String(this.plugin.settings.redirectPort))
+          .onChange(async (value) => {
+            const port = parseInt(value, 10);
+            if (!isNaN(port) && port > 0 && port <= 65535) {
+              this.plugin.settings.redirectPort = port;
+              this.plugin.scheduleSaveSettings();
+            }
+          }),
+      );
 
     new Setting(containerEl)
       .setName("Auto-refresh interval (minutes)")
@@ -269,18 +243,12 @@ export class IrisMailSettingsTab extends PluginSettingTab {
 
     // Event & Task Detection section
     containerEl.createEl("h3", { text: "Event & Task Detection" });
-
-    new Setting(containerEl)
-      .setName("Auto-detect events & tasks")
-      .setDesc("Automatically scan emails for calendar events and actionable tasks.")
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.enableAutoItemDetection)
-          .onChange(async (value) => {
-            this.plugin.settings.enableAutoItemDetection = value;
-            this.plugin.scheduleSaveSettings();
-          }),
-      );
+    containerEl.createEl("p", {
+      text:
+        "Right-click selected text inside an email to create an event or task note. " +
+        "Use the refresh button on a message to scan the full email at once.",
+      cls: "setting-item-description",
+    });
 
     new Setting(containerEl)
       .setName("Event note folder")
@@ -503,35 +471,6 @@ export class IrisMailSettingsTab extends PluginSettingTab {
         }),
       );
 
-    // Account section
-    containerEl.createEl("h3", { text: "Account" });
-
-    if (this.plugin.authProvider?.isSignedIn()) {
-      const account = this.plugin.authProvider.getAccount();
-      new Setting(containerEl)
-        .setName("Signed in as")
-        .setDesc(account?.username || "Unknown")
-        .addButton((btn) =>
-          btn.setButtonText("Sign out").onClick(async () => {
-            await this.plugin.handleLogout();
-            this.display();
-          }),
-        );
-    } else {
-      new Setting(containerEl)
-        .setName("Not signed in")
-        .setDesc("Sign in to access your Outlook inbox.")
-        .addButton((btn) =>
-          btn
-            .setButtonText("Sign in")
-            .setCta()
-            .onClick(async () => {
-              await this.plugin.handleLogin();
-              this.display();
-            }),
-        );
-    }
-
     // Advanced section
     containerEl.createEl("h3", { text: "Advanced" });
 
@@ -547,6 +486,232 @@ export class IrisMailSettingsTab extends PluginSettingTab {
             this.plugin.scheduleSaveSettings();
           }),
       );
+  }
+
+  private renderAccount(containerEl: HTMLElement, account: Account): void {
+    const wrap = containerEl.createDiv({ cls: "iris-account-card" });
+
+    // Header: label + provider + sign-in/out
+    const entry = this.plugin.accounts.get(account.id);
+    const signedIn = !!entry?.auth.isSignedIn();
+    const signedInAs = entry?.auth.getAccount()?.username;
+    const providerLabel =
+      account.provider === "imap" ? "IMAP" : "Outlook (Azure)";
+
+    new Setting(wrap)
+      .setName(account.label)
+      .setDesc(
+        providerLabel +
+          (signedIn ? ` — signed in as ${signedInAs ?? "(unknown)"}` : " — not signed in") +
+          (account.enabled ? "" : " — disabled"),
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setTooltip("Include in unified inbox")
+          .setValue(account.enabled)
+          .onChange(async (value) => {
+            await this.plugin.updateAccount({ ...account, enabled: value });
+            this.display();
+          }),
+      )
+      .addButton((btn) => {
+        if (signedIn) {
+          btn.setButtonText("Sign out").onClick(async () => {
+            await this.plugin.logoutAccount(account.id);
+            this.display();
+          });
+        } else {
+          btn.setButtonText("Sign in").setCta().onClick(async () => {
+            await this.plugin.loginAccount(account.id);
+            this.display();
+          });
+        }
+      })
+      .addButton((btn) =>
+        btn
+          .setButtonText("Remove")
+          .setWarning()
+          .onClick(async () => {
+            await this.plugin.removeAccount(account.id);
+            this.display();
+          }),
+      );
+
+    // Label edit
+    new Setting(wrap)
+      .setName("Label")
+      .addText((text) =>
+        text
+          .setPlaceholder(providerLabel)
+          .setValue(account.label)
+          .onChange(async (value) => {
+            await this.plugin.updateAccount({ ...account, label: value.trim() || account.label });
+          }),
+      );
+
+    // Per-provider credentials
+    if (account.provider === "outlook") {
+      new Setting(wrap)
+        .setName("Azure Client ID")
+        .setDesc("Application (client) ID from your Azure Entra app registration.")
+        .addText((text) =>
+          text
+            .setPlaceholder("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
+            .setValue(account.clientId ?? "")
+            .onChange(async (value) => {
+              await this.plugin.updateAccount({ ...account, clientId: value.trim() });
+            }),
+        );
+
+      new Setting(wrap)
+        .setName("Authority")
+        .setDesc("Use 'common' for any account, or your tenant ID for org-only.")
+        .addText((text) =>
+          text
+            .setPlaceholder(MSAL_AUTHORITY_DEFAULT)
+            .setValue(account.authority ?? "")
+            .onChange(async (value) => {
+              await this.plugin.updateAccount({ ...account, authority: value.trim() });
+            }),
+        );
+
+      new Setting(wrap)
+        .setName("Sign-in method")
+        .addDropdown((dropdown) =>
+          dropdown
+            .addOptions({ "auth-code": "Browser redirect", "device-code": "Device code" })
+            .setValue(account.authMethod ?? "auth-code")
+            .onChange(async (value) => {
+              await this.plugin.updateAccount({ ...account, authMethod: value as AuthMethod });
+            }),
+        );
+    } else {
+      // IMAP
+      const preset = getImapPreset(account.imapPreset);
+      const presetSetting = new Setting(wrap)
+        .setName("Provider preset")
+        .addDropdown((dd) => {
+          for (const p of IMAP_PRESETS) dd.addOption(p.key, p.label);
+          dd.setValue(account.imapPreset ?? "other");
+          dd.onChange(async (value) => {
+            const p = getImapPreset(value);
+            const patch: Account = { ...account, imapPreset: value };
+            if (p && p.host) {
+              patch.imapHost = p.host;
+              patch.imapPort = p.port;
+              patch.imapSecure = p.secure;
+            }
+            await this.plugin.updateAccount(patch);
+            this.display();
+          });
+        });
+
+      if (preset?.hint) {
+        const descFrag = document.createDocumentFragment();
+        descFrag.appendText(preset.hint);
+        if (preset.appPasswordUrl) {
+          descFrag.appendText(" ");
+          descFrag.createEl("a", {
+            text: "Open app password page",
+            href: preset.appPasswordUrl,
+          });
+        }
+        presetSetting.setDesc(descFrag);
+      } else {
+        presetSetting.setDesc("Pick your provider, or 'Other' for a custom server.");
+      }
+
+      // Always read the current account by id when patching — the closure's
+      // `account` snapshot goes stale as soon as any previous onChange fires.
+      const patch = async (delta: Partial<Account>): Promise<void> => {
+        const current = this.plugin.settings.accounts.find((a) => a.id === account.id);
+        if (!current) return;
+        await this.plugin.updateAccount({ ...current, ...delta });
+      };
+
+      new Setting(wrap)
+        .setName("Email address")
+        .setDesc("Your IMAP login — usually the full email address.")
+        .addText((text) =>
+          text
+            .setPlaceholder("you@example.com")
+            .setValue(account.imapEmail ?? "")
+            .onChange(async (value) => {
+              await patch({ imapEmail: value.trim() });
+            }),
+        );
+
+      new Setting(wrap)
+        .setName("IMAP host")
+        .addText((text) =>
+          text
+            .setPlaceholder("imap.example.com")
+            .setValue(account.imapHost ?? "")
+            .onChange(async (value) => {
+              await patch({ imapHost: value.trim() });
+            }),
+        );
+
+      new Setting(wrap)
+        .setName("IMAP port")
+        .addText((text) =>
+          text
+            .setPlaceholder("993")
+            .setValue(account.imapPort ? String(account.imapPort) : "")
+            .onChange(async (value) => {
+              const port = parseInt(value, 10);
+              if (!isNaN(port) && port > 0 && port <= 65535) {
+                await patch({ imapPort: port });
+              }
+            }),
+        );
+
+      new Setting(wrap)
+        .setName("Use TLS")
+        .setDesc("Required for port 993. Disable only for STARTTLS on port 143.")
+        .addToggle((toggle) =>
+          toggle
+            .setValue(account.imapSecure ?? true)
+            .onChange(async (value) => {
+              await patch({ imapSecure: value });
+            }),
+        );
+
+      {
+        const imapAuth = entry?.auth instanceof ImapAuthProvider ? entry.auth : null;
+        const hasSaved = !!imapAuth?.hasStoredPassword();
+        const SENTINEL = "••••••••••••••••";
+        new Setting(wrap)
+          .setName("App password")
+          .setDesc(
+            hasSaved
+              ? "A password is saved. Click and type to replace it."
+              : "Saved encrypted as you type. Use an app-specific password — not your account password.",
+          )
+          .addText((text) => {
+            text.inputEl.type = "password";
+            if (hasSaved) {
+              text.setValue(SENTINEL);
+            } else {
+              text.setPlaceholder("xxxx xxxx xxxx xxxx");
+            }
+            // Clear the sentinel on focus so the user can type without
+            // appending to it. Restore on blur if they didn't type anything.
+            text.inputEl.addEventListener("focus", () => {
+              if (text.inputEl.value === SENTINEL) text.setValue("");
+            });
+            text.inputEl.addEventListener("blur", () => {
+              if (!text.inputEl.value && hasSaved) text.setValue(SENTINEL);
+            });
+            text.onChange((value) => {
+              if (value === SENTINEL) return;
+              // Empty while something's saved = leave the stored password alone.
+              if (!value && hasSaved) return;
+              imapAuth?.setPassword(value);
+            });
+          });
+      }
+    }
   }
 
   private openTagEditModal(cat: string): void {

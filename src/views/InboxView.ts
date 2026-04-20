@@ -15,6 +15,7 @@ import {
 import { MessageList } from "./components/MessageList";
 import { MessageViewer } from "./components/MessageViewer";
 import { NicknameModal } from "./components/NicknameModal";
+import { SenderRuleModal } from "./components/SenderRuleModal";
 import { CreateTagModal } from "./components/CreateTagModal";
 import { SearchBar } from "./components/SearchBar";
 import { Toolbar } from "./components/Toolbar";
@@ -31,8 +32,8 @@ import type {
   Message,
   MessageListState,
   SenderGroup,
-  GraphPagedResponse,
 } from "../types";
+import type { MailListResponse } from "../mail/MailApi";
 
 /**
  * Normalize "LastName, FirstName" to "FirstName LastName".
@@ -54,7 +55,6 @@ export class InboxView extends ItemView {
   private toolbar!: Toolbar;
   private compactResizeObserver: ResizeObserver | null = null;
 
-  private inboxFolderId: string | null = null;
   private messageState: MessageListState = {
     messages: [],
     nextLink: null,
@@ -121,7 +121,7 @@ export class InboxView extends ItemView {
     container.empty();
     container.addClass("iris-mail-container");
 
-    // Hide the top toolbar when vertical space is at a premium.
+    // Collapse to single-pane layout (list OR viewer) when vertical space is tight.
     const COMPACT_HEIGHT_PX = 700;
     const updateCompact = () => {
       container.toggleClass(
@@ -136,18 +136,7 @@ export class InboxView extends ItemView {
     this.compactResizeObserver.observe(container);
     updateCompact();
 
-    if (
-      !this.plugin.authProvider.isSignedIn() &&
-      this.plugin.settings.clientId
-    ) {
-      try {
-        await this.plugin.authProvider.initialize(this.plugin.settings);
-      } catch {
-        // silent init failed
-      }
-    }
-
-    if (!this.plugin.authProvider.isSignedIn()) {
+    if (!this.plugin.accounts.anySignedIn()) {
       this.renderSignInPrompt(container);
       return;
     }
@@ -182,6 +171,16 @@ export class InboxView extends ItemView {
     this.nicknameCache = this.plugin.store.getAllNicknames();
   }
 
+  /** Display name of the signed-in user that owns this message, used as
+   *  context for Claude prompts. Falls back to empty string if unknown. */
+  private getMessageOwnerName(msg: Message): string {
+    const accountId = msg._accountId;
+    if (!accountId) return "";
+    const entry = this.plugin.accounts.get(accountId);
+    const acct = entry?.auth.getAccount();
+    return acct?.name || acct?.username || "";
+  }
+
   // --- Private: rendering ---
 
   private renderSignInPrompt(container: HTMLElement): void {
@@ -189,122 +188,41 @@ export class InboxView extends ItemView {
     const icon = prompt.createDiv({ cls: "iris-sign-in-icon" });
     setIcon(icon, "mail");
     prompt.createEl("h3", { text: "Iris Mail" });
-    prompt.createEl("p", {
-      cls: "iris-sign-in-desc",
-      text: "Connect your Microsoft account to get started.",
-    });
+
+    const accounts = this.plugin.settings.accounts;
+    if (accounts.length === 0) {
+      prompt.createEl("p", {
+        cls: "iris-sign-in-desc",
+        text: "Add an account in Iris Mail settings to get started — via Azure (OAuth) or via IMAP.",
+      });
+    } else {
+      prompt.createEl("p", {
+        cls: "iris-sign-in-desc",
+        text: "Sign in to one of your configured accounts.",
+      });
+    }
 
     const btnGroup = prompt.createDiv({ cls: "iris-sign-in-buttons" });
 
-    const browserBtn = btnGroup.createEl("button", {
-      text: "Sign in with browser",
-      cls: "mod-cta",
+    for (const account of accounts) {
+      const btn = btnGroup.createEl("button", {
+        text: `Sign in: ${account.label}`,
+        cls: "mod-cta",
+      });
+      btn.addEventListener("click", () => void this.plugin.loginAccount(account.id));
+    }
+
+    const settingsBtn = btnGroup.createEl("button", {
+      text: accounts.length === 0 ? "Open settings" : "Manage accounts",
     });
-
-    const deviceBtn = btnGroup.createEl("button", {
-      text: "Sign in with device code",
-    });
-
-    const startLogin = (method: "auth-code" | "device-code") => {
-      if (!this.plugin.settings.clientId) {
-        this.showClientIdEntry(prompt, btnGroup, method);
-        return;
-      }
-      if (method === "auth-code") this.plugin.handleLoginWithAuthCode();
-      else this.plugin.handleLoginWithDeviceCode();
-    };
-
-    browserBtn.addEventListener("click", () => startLogin("auth-code"));
-    deviceBtn.addEventListener("click", () => startLogin("device-code"));
+    settingsBtn.addEventListener("click", () => this.openIrisSettings());
   }
 
-  private showClientIdEntry(
-    prompt: HTMLElement,
-    btnGroup: HTMLElement,
-    method: "auth-code" | "device-code",
-  ): void {
-    // Avoid stacking multiple entries on repeat clicks
-    const existing = prompt.querySelector(".iris-clientid-entry");
-    if (existing) {
-      (existing.querySelector("input") as HTMLInputElement | null)?.focus();
-      return;
-    }
-    btnGroup.hide();
-
-    const entry = prompt.createDiv({ cls: "iris-clientid-entry" });
-    entry.createEl("label", {
-      cls: "iris-clientid-label",
-      text: "Azure Application (client) ID",
-    });
-
-    const inputWrap = entry.createDiv({ cls: "iris-clientid-input-wrap" });
-    const input = inputWrap.createEl("input", {
-      cls: "iris-clientid-input",
-      attr: {
-        type: "text",
-        placeholder: "00000000-0000-0000-0000-000000000000",
-        spellcheck: "false",
-        autocomplete: "off",
-      },
-    }) as HTMLInputElement;
-
-    const error = entry.createDiv({ cls: "iris-clientid-error" });
-
-    const help = entry.createEl("a", {
-      cls: "iris-clientid-help",
-      text: "Open Azure portal →",
-      href: "https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade",
-    });
-    help.setAttr("target", "_blank");
-    help.setAttr("rel", "noopener");
-
-    const actions = entry.createDiv({ cls: "iris-clientid-actions" });
-    const cancelBtn = actions.createEl("button", { text: "Cancel" });
-    const submitBtn = actions.createEl("button", {
-      text: "Continue",
-      cls: "mod-cta",
-    });
-    submitBtn.disabled = true;
-
-    const guidRe =
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-    const validate = (): boolean => {
-      const v = input.value.trim();
-      const ok = guidRe.test(v);
-      submitBtn.disabled = !ok;
-      error.setText(v.length > 0 && !ok ? "Must be a valid GUID." : "");
-      return ok;
-    };
-
-    const submit = async () => {
-      if (!validate()) return;
-      this.plugin.settings.clientId = input.value.trim();
-      await this.plugin.saveSettings();
-      entry.remove();
-      btnGroup.show();
-      if (method === "auth-code") this.plugin.handleLoginWithAuthCode();
-      else this.plugin.handleLoginWithDeviceCode();
-    };
-
-    input.addEventListener("input", validate);
-    input.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        void submit();
-      } else if (e.key === "Escape") {
-        e.preventDefault();
-        entry.remove();
-        btnGroup.show();
-      }
-    });
-    cancelBtn.addEventListener("click", () => {
-      entry.remove();
-      btnGroup.show();
-    });
-    submitBtn.addEventListener("click", () => void submit());
-
-    setTimeout(() => input.focus(), 0);
+  private openIrisSettings(): void {
+    // Open the plugin settings tab via Obsidian's Setting modal.
+    const setting = (this.app as unknown as { setting: { open(): void; openTabById(id: string): void } }).setting;
+    setting?.open();
+    setting?.openTabById("iris-mail");
   }
 
   private renderInboxUI(container: HTMLElement): void {
@@ -397,6 +315,7 @@ export class InboxView extends ItemView {
       onLoadMore: () => this.handleLoadMore(),
       onMultiSelect: (ids: Set<string>) => this.handleMultiSelect(ids),
       onEditNickname: (addr: string, rawName: string) => this.openNicknameModal(addr, rawName),
+      onEditSenderRule: (addr: string, rawName: string) => this.openSenderRuleModal(addr, rawName),
     }, nameResolver, effectiveSenderResolver);
 
     const viewerEl = rightPane.createDiv({ cls: "iris-message-viewer" });
@@ -409,6 +328,8 @@ export class InboxView extends ItemView {
       onBatchMarkAsUnread: (ids) => this.handleBatchMarkAsUnread(ids),
       onBatchTag: (ids, tag) => this.handleBatchTag(ids, tag),
       onBulkDenyTag: (ids, tag) => this.handleBulkDenyTag(ids, tag),
+      onDeleteMessage: (msg: Message) => this.handleDeleteMessage(msg),
+      onBatchDelete: (ids) => this.handleBatchDelete(ids),
       onCreateNoteFromSelection: (text, noteType, msg) => this.handleCreateNoteFromSelection(text, noteType, msg),
       onAcceptDetectedItem: (messageId, item) => this.handleAcceptDetectedItem(messageId, item),
       onDismissDetectedItem: (messageId, itemId) => this.handleDismissDetectedItem(messageId, itemId),
@@ -518,17 +439,11 @@ export class InboxView extends ItemView {
 
   private async loadInbox(): Promise<void> {
     try {
-      const folders = await this.plugin.mailApi.listFolders();
-      const inbox = folders.find(
-        (f) => f.displayName?.toLowerCase() === "inbox",
-      );
-      if (inbox) {
-        this.inboxFolderId = inbox.id || null;
-        await this.loadMessages(inbox.id!);
-        void this.syncLocalReadStateToServer();
-      }
+      // The dispatcher merges every account's Inbox; folderId is unused.
+      await this.loadMessages("");
+      void this.syncLocalReadStateToServer();
     } catch (err: unknown) {
-      if (!this.plugin.authProvider.isSignedIn()) {
+      if (!this.plugin.accounts.anySignedIn()) {
         this.renderCurrentView();
       } else {
         const msg = err instanceof Error ? err.message : String(err);
@@ -567,27 +482,26 @@ export class InboxView extends ItemView {
     const showRead = this.plugin.settings.showReadEmails;
     const searchQuery = this.messageState.searchQuery || undefined;
     try {
-      const filter = !showRead ? "isRead eq false" : undefined;
-
-      const response: GraphPagedResponse<Message> =
+      const response: MailListResponse<Message> =
         await this.plugin.mailApi.listMessages(folderId, {
           top: this.plugin.settings.pageSize,
           search: searchQuery,
-          filter,
+          unreadOnly: !showRead,
         });
 
       this.messageState.messages = response.value;
       this.plugin.store.applyReadState(this.messageState.messages);
-      this.messageState.nextLink = response["@odata.nextLink"] || null;
+      this.messageState.nextLink = response.nextLink;
       // Cache non-search list results so we can fall back on next failure.
       if (!searchQuery) {
         this.plugin.store.setMessageList(folderId, showRead, response.value, this.messageState.nextLink);
       }
+      this.applySenderRules();
       this.regroupAndSync();
       this.renderCurrentView();
       this.startBackgroundProcessing();
     } catch (err: unknown) {
-      if (!this.plugin.authProvider.isSignedIn()) {
+      if (!this.plugin.accounts.anySignedIn()) {
         this.renderCurrentView();
       } else {
         // Fall back to cached list if available (non-search queries only).
@@ -717,6 +631,104 @@ export class InboxView extends ItemView {
 
   private handleBatchMarkAsUnread(ids: Set<string>): void {
     this.handleBatchReadState(ids, false);
+  }
+
+  /** Move a single message to the provider's trash folder. Optimistically
+   *  removes it from the list; restores on API failure. */
+  private handleDeleteMessage(msg: Message): void {
+    if (!msg.id) return;
+    const id = msg.id;
+
+    const snapshot = [...this.messageState.messages];
+    this.messageState.messages = this.messageState.messages.filter((m) => m.id !== id);
+    this.refreshListCache();
+
+    const next = this.findNextUnread(id) ?? this.findNextMessage(id);
+
+    this.regroupAndSync();
+    this.renderCurrentView();
+    if (next) {
+      void this.showMessageInViewer(next);
+    } else {
+      this.selectedMessageId = null;
+      this.messageViewer.clear();
+      if (this.activeSender) this.handleBack();
+    }
+
+    void this.plugin.mailApi.deleteMessage(id).catch((err) => {
+      logger.warn("InboxView", "Delete failed, restoring", err);
+      this.messageState.messages = snapshot;
+      this.refreshListCache();
+      this.regroupAndSync();
+      this.renderCurrentView();
+      const errMsg = err instanceof Error ? err.message : String(err);
+      new Notice(`Couldn't delete on server — restored (${errMsg}).`);
+    });
+  }
+
+  /** Batch-delete selected messages. Each request fires in parallel;
+   *  individual failures restore only that message. */
+  private handleBatchDelete(ids: Set<string>): void {
+    const victims = this.messageState.messages.filter((m) => m.id && ids.has(m.id));
+    if (victims.length === 0) return;
+
+    const victimIds = new Set(victims.map((m) => m.id!));
+    this.messageState.messages = this.messageState.messages.filter((m) => !m.id || !victimIds.has(m.id));
+    this.refreshListCache();
+
+    this.regroupAndSync();
+    this.messageList.clearMultiSelection();
+    this.messageViewer.clear();
+    this.renderCurrentView();
+
+    const api = this.plugin.mailApi;
+    for (const msg of victims) {
+      const id = msg.id!;
+      void api.deleteMessage(id).catch((err) => {
+        logger.warn("InboxView", `Delete failed for ${id}, restoring`, err);
+        if (!this.messageState.messages.some((m) => m.id === id)) {
+          this.messageState.messages.push(msg);
+          this.messageState.messages.sort(
+            (a, b) =>
+              new Date(b.receivedDateTime ?? 0).getTime() -
+              new Date(a.receivedDateTime ?? 0).getTime(),
+          );
+          this.refreshListCache();
+          this.regroupAndSync();
+          this.renderCurrentView();
+        }
+        const errMsg = err instanceof Error ? err.message : String(err);
+        new Notice(`Couldn't delete "${msg.subject || "(no subject)"}" — restored (${errMsg}).`);
+      });
+    }
+  }
+
+  /** Update the cached message list to match current in-memory state. */
+  private refreshListCache(): void {
+    const showRead = this.plugin.settings.showReadEmails;
+    this.plugin.store.setMessageList(
+      "", showRead,
+      this.messageState.messages,
+      this.messageState.nextLink,
+    );
+  }
+
+  /** Find the next message after currentId in the active sort order. */
+  private findNextMessage(currentId: string): Message | null {
+    const dir = this.sortNewestFirst ? -1 : 1;
+    const src = this.activeSender
+      ? (this.senderGroups.find((s) => s.groupKey === this.activeSender!.groupKey)?.messages
+        ?? this.activeSender.messages)
+      : this.messageState.messages;
+    const list = [...src].sort(
+      (a, b) =>
+        dir *
+        (new Date(a.receivedDateTime || 0).getTime() -
+          new Date(b.receivedDateTime || 0).getTime()),
+    );
+    const idx = list.findIndex((m) => m.id === currentId);
+    if (idx === -1) return list[0] ?? null;
+    return list[idx + 1] ?? list[idx - 1] ?? null;
   }
 
   private handleBatchTag(ids: Set<string>, tag: string): void {
@@ -859,18 +871,6 @@ export class InboxView extends ItemView {
     this.messageViewer.setDetectedItems(this.detectedItemsCache.get(msg.id!) || []);
     this.messageViewer.render(msg, stripped);
 
-    // On-demand item detection: run if never scanned, OR if previously
-    // scanned with 0 results (earlier scan may have had empty content).
-    // Only fire here when Claude-processed markdown is already cached;
-    // otherwise detection will be triggered after processing completes.
-    if (msg.id) {
-      const scanned = this.plugin.store.hasItemsScan(msg.id);
-      const hasItems = (this.detectedItemsCache.get(msg.id)?.length ?? 0) > 0;
-      if ((!scanned || !hasItems) && cache.getProcessed(msg.id)) {
-        void this.detectItemsOnDemand(msg);
-      }
-    }
-
     // --- Processed markdown: L1 memory → L2 disk → Claude API ---
     const msgId = msg.id!;
     const s = this.plugin.settings;
@@ -944,13 +944,6 @@ export class InboxView extends ItemView {
         if (this.selectedMessageId === msgId) {
           this.messageViewer.showProcessedMarkdown(msgId, markdown);
         }
-
-        // Trigger item detection now that processed markdown is available
-        const scanned = this.plugin.store.hasItemsScan(msgId);
-        const hasItems = (this.detectedItemsCache.get(msgId)?.length ?? 0) > 0;
-        if (!scanned || !hasItems) {
-          void this.detectItemsOnDemand(msg);
-        }
       })
       .catch((err) => {
         const errMsg = err instanceof Error ? err.message : String(err);
@@ -963,15 +956,14 @@ export class InboxView extends ItemView {
 
   private async handleSearch(query: string): Promise<void> {
     this.messageState.searchQuery = query;
-    if (!this.inboxFolderId) return;
-    await this.loadMessages(this.inboxFolderId);
+    await this.loadMessages("");
   }
 
   private async handleLoadMore(): Promise<void> {
     if (!this.messageState.nextLink) return;
 
     try {
-      const response: GraphPagedResponse<Message> =
+      const response: MailListResponse<Message> =
         await this.plugin.mailApi.listMessages("", {
           nextLink: this.messageState.nextLink,
         });
@@ -981,7 +973,7 @@ export class InboxView extends ItemView {
         ...this.messageState.messages,
         ...response.value,
       ];
-      this.messageState.nextLink = response["@odata.nextLink"] || null;
+      this.messageState.nextLink = response.nextLink;
 
       this.regroupAndSync();
       this.renderCurrentView();
@@ -1048,11 +1040,8 @@ export class InboxView extends ItemView {
   }
 
   private renderCurrentView(): void {
-    if (!this.plugin.authProvider.isSignedIn()) {
-      this.messageList.renderLoggedOut(
-        () => this.plugin.handleLoginWithAuthCode(),
-        () => this.plugin.handleLoginWithDeviceCode(),
-      );
+    if (!this.plugin.accounts.anySignedIn()) {
+      this.messageList.renderLoggedOut(() => this.openIrisSettings());
       return;
     }
 
@@ -1134,8 +1123,6 @@ export class InboxView extends ItemView {
     if (s.resolveForwardedSender && (!s.enableClaudeProcessing || !hasClaudeAccess(s.anthropicApiKey))) {
       void this.prefetchBodiesForSenderResolution();
     }
-
-    void this.autoDetectItems();
   }
 
   /** Return nickname if available, otherwise normalize "Last, First" to "First Last". */
@@ -1186,6 +1173,100 @@ export class InboxView extends ItemView {
       },
       regenerate,
     ).open();
+  }
+
+  /** Open a modal to create or edit an automation rule for a sender. */
+  private openSenderRuleModal(address: string, rawName: string): void {
+    const key = address.toLowerCase();
+    const s = this.plugin.settings;
+    const current = s.senderRules?.[key];
+    new SenderRuleModal(
+      this.plugin.app,
+      address,
+      this.resolveName(address, rawName),
+      this.getTagCategories(),
+      current,
+      (addr, rule) => {
+        const k = addr.toLowerCase();
+        const rules = { ...(this.plugin.settings.senderRules || {}) };
+        rules[k] = rule;
+        this.plugin.settings.senderRules = rules;
+        this.plugin.scheduleSaveSettings();
+        this.applySenderRules();
+        new Notice(`Rule saved for ${addr}.`);
+      },
+      (addr) => {
+        const k = addr.toLowerCase();
+        const rules = { ...(this.plugin.settings.senderRules || {}) };
+        if (!(k in rules)) return;
+        delete rules[k];
+        this.plugin.settings.senderRules = rules;
+        this.plugin.scheduleSaveSettings();
+        new Notice(`Rule removed for ${addr}.`);
+      },
+    ).open();
+  }
+
+  /** Apply all active sender rules to the currently-loaded messages.
+   *  Runs after loadMessages and when a rule is saved. */
+  private applySenderRules(): void {
+    const rules = this.plugin.settings.senderRules;
+    if (!rules || Object.keys(rules).length === 0) return;
+
+    const toBin: Message[] = [];
+    const toTag: { msgId: string; tag: string }[] = [];
+
+    for (const msg of this.messageState.messages) {
+      const addr = msg.from?.emailAddress?.address?.toLowerCase();
+      if (!addr) continue;
+      const rule = rules[addr];
+      if (!rule) continue;
+
+      if (rule.autoBin) {
+        toBin.push(msg);
+        continue; // Skip tagging — message is about to be deleted.
+      }
+      if (rule.autoTag && msg.id) {
+        const existing = this.tagCache.get(msg.id) || [];
+        if (!existing.some((e) => e.tag === rule.autoTag)) {
+          toTag.push({ msgId: msg.id, tag: rule.autoTag });
+        }
+      }
+    }
+
+    for (const { msgId, tag } of toTag) {
+      const existing = this.tagCache.get(msgId) || [];
+      const entry: TagCacheEntry = {
+        messageId: msgId,
+        tag,
+        source: "manual",
+        taggedAt: Date.now(),
+      };
+      this.tagCache.set(msgId, [...existing, entry]);
+      this.plugin.store.setTag(msgId, tag, "manual");
+    }
+    if (toTag.length > 0) this.messageViewer.setTagCache(this.tagCache);
+
+    if (toBin.length > 0) {
+      const victimIds = new Set(toBin.map((m) => m.id!).filter(Boolean));
+      this.messageState.messages = this.messageState.messages.filter(
+        (m) => !m.id || !victimIds.has(m.id),
+      );
+      this.refreshListCache();
+      this.regroupAndSync();
+      this.renderCurrentView();
+
+      const api = this.plugin.mailApi;
+      for (const msg of toBin) {
+        const id = msg.id;
+        if (!id) continue;
+        void api.deleteMessage(id).catch((err) => {
+          logger.warn("InboxView", `Auto-bin failed for ${id}`, err);
+        });
+      }
+    } else if (toTag.length > 0) {
+      this.renderCurrentView();
+    }
   }
 
   /**
@@ -1311,9 +1392,9 @@ export class InboxView extends ItemView {
     const msgs = this.filterSenderMessages(sender.messages);
     void this.messageList.renderSenderMessages(displayName, msgs);
 
-    // Auto-select the latest message
+    // Auto-select the message at the top of the rendered list.
     if (msgs.length > 0) {
-      void this.showMessageInViewer(msgs[msgs.length - 1]);
+      void this.showMessageInViewer(msgs[0]);
     }
   }
 
@@ -1616,9 +1697,8 @@ export class InboxView extends ItemView {
     const promptHash = EmailStore.hashPrompt(effectivePrompt);
     const cache = this.plugin.store;
 
-    const candidates = limit === -1
-      ? this.messageState.messages
-      : this.messageState.messages.slice(0, limit);
+    const unread = this.messageState.messages.filter((m) => !m.isRead);
+    const candidates = limit === -1 ? unread : unread.slice(0, limit);
 
     // ── Phase 1: Fetch all bodies ────────────────────────────
     // Collect body data for each candidate before any Claude processing so
@@ -1754,79 +1834,10 @@ export class InboxView extends ItemView {
     }
   }
 
-  // ── Auto-detection of events and tasks ─────────────────────
+  // ── User-initiated event/task detection ─────────────────────
 
-  private async autoDetectItems(): Promise<void> {
-    const s = this.plugin.settings;
-    if (!s.enableAutoItemDetection || !s.enableClaudeProcessing || !hasClaudeAccess(s.anthropicApiKey)) return;
-
-    const gen = this.prefetchGeneration;
-
-    // Wait for prefetch so email bodies are cached
-    if (this.prefetchAllPromise) {
-      try { await this.prefetchAllPromise; } catch { /* proceed anyway */ }
-    }
-    if (this.prefetchGeneration !== gen) return;
-
-    const cache = this.plugin.store;
-    const effectivePrompt = s.itemDetectionPrompt || ITEM_DETECTION_PROMPT;
-
-    const limit = s.prefetchLimit;
-    const candidates = limit === -1
-      ? this.messageState.messages
-      : limit === 0
-        ? []
-        : this.messageState.messages.slice(0, limit);
-
-    for (const msg of candidates) {
-      if (this.prefetchGeneration !== gen) return;
-
-      const msgId = msg.id;
-      if (!msgId) continue;
-
-      // Skip if already scanned
-      if (cache.hasItemsScan(msgId)) {
-        // Warm L1 from L2
-        if (!this.detectedItemsCache.has(msgId)) {
-          const items = cache.getDetectedItems(msgId);
-          if (items.length > 0) this.detectedItemsCache.set(msgId, items);
-        }
-        continue;
-      }
-
-      // Only use Claude-processed markdown — skip if not yet processed.
-      const processed = cache.getProcessed(msgId);
-      if (!processed) continue;
-      const parsed = processed.processedMarkdown;
-      if (!parsed) continue;
-
-      const account = this.plugin.authProvider.getAccount();
-      const emailContext = {
-        subject: msg.subject || "",
-        from: msg.from?.emailAddress?.name || msg.from?.emailAddress?.address || "",
-        date: msg.receivedDateTime || "",
-        userName: account?.name || account?.username || "",
-      };
-
-      try {
-        const detected = await detectItemsInEmail(
-          s.anthropicApiKey, s.claudeModel, effectivePrompt, parsed, emailContext,
-        );
-        if (this.prefetchGeneration !== gen) return;
-
-        cache.setItemsScanned(msgId);
-
-        this.storeDetectedItems(msgId, detected);
-      } catch (err) {
-        logger.warn("InboxView", `Item detection failed for ${msgId}`, err);
-      }
-    }
-  }
-
-  /** Run item detection for a single message when the user opens it (on-demand). */
-  /** Run item detection for a single message when the user opens it.
-   *  Works whenever Claude processing is enabled, regardless of the
-   *  auto-detection background toggle. */
+  /** Run item detection for a single message, triggered by the user via
+   *  the reload button in the message viewer. */
   private async detectItemsOnDemand(msg: Message): Promise<void> {
     const s = this.plugin.settings;
     if (!s.enableClaudeProcessing || !hasClaudeAccess(s.anthropicApiKey)) return;
@@ -1843,12 +1854,11 @@ export class InboxView extends ItemView {
     if (!content) return;
 
     const effectivePrompt = s.itemDetectionPrompt || ITEM_DETECTION_PROMPT;
-    const account = this.plugin.authProvider.getAccount();
     const emailContext = {
       subject: msg.subject || "",
       from: msg.from?.emailAddress?.name || msg.from?.emailAddress?.address || "",
       date: msg.receivedDateTime || "",
-      userName: account?.name || account?.username || "",
+      userName: this.getMessageOwnerName(msg),
     };
 
     try {

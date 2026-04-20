@@ -2,26 +2,52 @@ import type * as MicrosoftGraph from "@microsoft/microsoft-graph-types";
 
 // Re-export Graph types we use frequently
 export type MailFolder = MicrosoftGraph.MailFolder;
-export type Message = MicrosoftGraph.Message;
 export type Recipient = MicrosoftGraph.Recipient;
 export type ItemBody = MicrosoftGraph.ItemBody;
 
-// Graph API list response with pagination
-export interface GraphPagedResponse<T> {
-  "@odata.context"?: string;
-  "@odata.nextLink"?: string;
-  value: T[];
-}
+/**
+ * Plugin-level message type. The `id` is composite (`{accountId}:{nativeId}`)
+ * once it has flowed through MailDispatcher. The leading-underscore fields
+ * are transient — they're attached at fan-out time so the UI can show which
+ * account a message belongs to and are NOT persisted.
+ */
+export type Message = MicrosoftGraph.Message & {
+  _accountId?: string;
+  _accountLabel?: string;
+};
 
 // Plugin settings
+export type MailProvider = "outlook" | "imap";
 export type AuthMethod = "auth-code" | "device-code";
 export type BadgeCountMode = "off" | "unread" | "total";
 export type BadgePosition = "top-right" | "top-left" | "bottom-right" | "bottom-left" | "off";
 
+/**
+ * One configured mail account. Multiple accounts run simultaneously and the
+ * inbox view shows their messages merged together. The `id` is a stable
+ * opaque token used to namespace tokens, messages, and cache entries.
+ */
+export interface Account {
+  id: string;
+  label: string;
+  provider: MailProvider;
+  /** Whether this account contributes to the unified inbox. */
+  enabled: boolean;
+  // Outlook
+  clientId?: string;
+  authority?: string;
+  authMethod?: AuthMethod;
+  // IMAP (generic)
+  imapHost?: string;
+  imapPort?: number;
+  imapSecure?: boolean;
+  imapEmail?: string;
+  /** Optional preset key used to pre-fill host/port in the UI. */
+  imapPreset?: string;
+}
+
 export interface IrisMailSettings {
-  clientId: string;
-  authority: string;
-  authMethod: AuthMethod;
+  accounts: Account[];
   redirectPort: number;
   refreshIntervalMinutes: number;
   pageSize: number;
@@ -50,20 +76,28 @@ export interface IrisMailSettings {
   prefetchLimit: number;
   /** Show the original sender of forwarded emails instead of the forwarder. */
   resolveForwardedSender: boolean;
-  /** Enable automatic event/task detection in emails. */
-  enableAutoItemDetection: boolean;
   /** Folder for auto-created event notes. */
   eventNoteFolderPath: string;
   /** Folder for auto-created task notes. */
   taskNoteFolderPath: string;
   /** Custom prompt for event/task extraction (overrides default). */
   itemDetectionPrompt: string;
+  /** Per-sender automation rules, keyed by lowercased email address. */
+  senderRules: Record<string, SenderRule>;
   // Persisted view state
   viewMode: "messages" | "senders";
   sortNewestFirst: boolean;
   filterUnreadOnly: boolean;
   /** Enable debug logging to console. */
   debugLogging: boolean;
+}
+
+/** Automation rule applied to every incoming message from a given sender. */
+export interface SenderRule {
+  /** Move new messages to the provider's trash folder on arrival. */
+  autoBin?: boolean;
+  /** Apply this tag to new messages on arrival. Empty string = none. */
+  autoTag?: string;
 }
 
 // Sender grouping
@@ -90,4 +124,3 @@ export interface FolderState {
   selectedFolderId: string | null;
 }
 
-export type AuthState = "signed-out" | "signing-in" | "signed-in" | "error";

@@ -65,7 +65,8 @@ export interface MessageListCacheEntry {
 }
 
 export interface EmailStoreIndex {
-  version: 1;
+  /** v1 = single-account; v2 = composite ids `{accountId}:{nativeId}`. */
+  version: 2;
   bodies: Record<string, BodyCacheEntry>;
   /** Last successful message list per `${folderId}:${showRead ? "all" : "unread"}`. */
   messageLists: Record<string, MessageListCacheEntry>;

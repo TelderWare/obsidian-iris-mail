@@ -1,4 +1,4 @@
-import { setIcon } from "obsidian";
+import { Menu, setIcon } from "obsidian";
 import type { Message, SenderGroup } from "../../types";
 import { formatRelativeDate } from "../../utils/dateFormat";
 import { getEnvelopeSender } from "../../utils/envelopeSender";
@@ -68,6 +68,8 @@ interface MessageListCallbacks {
   onLoadMore: () => void;
   onMultiSelect: (selectedIds: Set<string>) => void;
   onEditNickname: (address: string, rawName: string) => void;
+  /** Open the sender-rule editor (auto-bin, auto-tag, ...) for an address. */
+  onEditSenderRule: (address: string, rawName: string) => void;
 }
 
 export type NameResolver = (address: string, rawName: string) => string;
@@ -83,12 +85,6 @@ export type EffectiveSenderResolver = (msg: Message) => EffectiveSender;
 
 /** Maximum items to render per page before showing "Show more". */
 const PAGE_SIZE = 100;
-
-/** True when the user has opted into reduced motion at the OS level. */
-function prefersReducedMotion(): boolean {
-  return typeof window !== "undefined"
-    && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
-}
 
 /** Render the shared "All caught up" empty state. */
 function renderEmptyState(parent: HTMLElement): void {
@@ -178,7 +174,21 @@ export class MessageList {
       span.addEventListener("contextmenu", (evt) => {
         evt.preventDefault();
         evt.stopPropagation();
-        this.callbacks.onEditNickname(address, rawName);
+
+        const menu = new Menu();
+        menu.addItem((item) =>
+          item
+            .setTitle("Edit nickname…")
+            .setIcon("pencil")
+            .onClick(() => this.callbacks.onEditNickname(address, rawName)),
+        );
+        menu.addItem((item) =>
+          item
+            .setTitle("Create rule…")
+            .setIcon("filter")
+            .onClick(() => this.callbacks.onEditSenderRule(address, rawName)),
+        );
+        menu.showAtMouseEvent(evt);
       });
     }
     return span;
@@ -272,102 +282,11 @@ export class MessageList {
     return new Set(this.selectedIds);
   }
 
-  /**
-   * FLIP-style transition: snapshot current row positions, run the rebuild,
-   * then (in parallel) collapse ghost clones of disappeared rows and translate
-   * surviving rows from their old positions to their new ones. Everything
-   * animates synchronously over a single 220ms window.
-   */
   private async transitionTo(
-    keepIds: Set<string>,
+    _keepIds: Set<string>,
     rebuild: () => void,
   ): Promise<void> {
-    if (prefersReducedMotion()) {
-      rebuild();
-      return;
-    }
-    const DURATION = 220;
-
-    // Snapshot old positions and disappearing row visuals before the rebuild.
-    const oldRects = new Map<string, DOMRect>();
-    const ghosts: Array<{ ghost: HTMLElement; rect: DOMRect; height: number }> = [];
-    for (const [id, ref] of this.rowRefs) {
-      const rect = ref.el.getBoundingClientRect();
-      oldRects.set(id, rect);
-      if (!keepIds.has(id)) {
-        const ghost = ref.el.cloneNode(true) as HTMLElement;
-        ghosts.push({ ghost, rect, height: rect.height });
-      }
-    }
-
-    if (oldRects.size === 0) {
-      rebuild();
-      return;
-    }
-
     rebuild();
-
-    const container = this.containerEl;
-    const containerStyle = window.getComputedStyle(container);
-    if (containerStyle.position === "static") {
-      container.style.position = "relative";
-    }
-    const containerRect = container.getBoundingClientRect();
-
-    // Overlay ghosts at their pre-rebuild positions and collapse them.
-    const animations: Promise<void>[] = [];
-    for (const { ghost, rect, height } of ghosts) {
-      ghost.removeClass("is-selected");
-      ghost.style.position = "absolute";
-      ghost.style.top = `${rect.top - containerRect.top + container.scrollTop}px`;
-      ghost.style.left = `${rect.left - containerRect.left}px`;
-      ghost.style.width = `${rect.width}px`;
-      ghost.style.height = `${height}px`;
-      ghost.style.margin = "0";
-      ghost.style.pointerEvents = "none";
-      ghost.style.zIndex = "1";
-      container.appendChild(ghost);
-
-      void ghost.offsetHeight;
-
-      ghost.addClass("is-collapsing");
-      requestAnimationFrame(() => {
-        ghost.style.height = "0px";
-      });
-
-      animations.push(new Promise((resolve) => {
-        const cleanup = () => { ghost.remove(); resolve(); };
-        setTimeout(cleanup, DURATION + 40);
-      }));
-    }
-
-    // FLIP the surviving rows from their old positions to their new ones.
-    for (const [id, ref] of this.rowRefs) {
-      const oldRect = oldRects.get(id);
-      if (!oldRect) continue;
-      const newRect = ref.el.getBoundingClientRect();
-      const dy = oldRect.top - newRect.top;
-      if (Math.abs(dy) < 0.5) continue;
-
-      const el = ref.el;
-      el.style.transition = "none";
-      el.style.transform = `translateY(${dy}px)`;
-      void el.offsetHeight;
-      el.style.transition = `transform ${DURATION}ms ease`;
-      requestAnimationFrame(() => {
-        el.style.transform = "";
-      });
-
-      animations.push(new Promise((resolve) => {
-        setTimeout(() => {
-          el.style.transition = "";
-          el.style.transform = "";
-          resolve();
-        }, DURATION + 40);
-      }));
-    }
-
-    await Promise.all(animations);
   }
 
   /** Flat message list: top-level messages view (no grouping, no drill-down). */
@@ -415,9 +334,15 @@ export class MessageList {
             : ""),
       });
 
-      // Row 1: sender name
+      // Row 1: sender name (+ optional account chip when multiple accounts)
       const nameEl = row.createDiv({ cls: "iris-msg-sender-name" });
       this.renderSenderName(nameEl, msg);
+      if (msg._accountLabel) {
+        nameEl.createSpan({
+          cls: "iris-msg-account-chip",
+          text: msg._accountLabel,
+        });
+      }
 
       // Row 2: [attachment slot] [subject · date]
       const clipSlot = row.createDiv({ cls: "iris-msg-slot-attachment" });
@@ -650,10 +575,7 @@ export class MessageList {
     }
   }
 
-  renderLoggedOut(
-    onBrowserSignIn: () => void,
-    onDeviceCodeSignIn: () => void,
-  ): void {
+  renderLoggedOut(onOpenSettings: () => void): void {
     this.containerEl.empty();
     this.rowRefs.clear();
     this.renderedOrder = [];
@@ -661,20 +583,14 @@ export class MessageList {
     const empty = this.containerEl.createDiv({ cls: "iris-empty-state" });
     const icon = empty.createDiv({ cls: "iris-empty-icon" });
     setIcon(icon, "log-out");
-    empty.createDiv({ cls: "iris-empty-title", text: "Signed out" });
+    empty.createDiv({ cls: "iris-empty-title", text: "No accounts signed in" });
 
     const btnGroup = empty.createDiv({ cls: "iris-sign-in-buttons" });
-
-    const browserBtn = btnGroup.createEl("button", {
-      text: "Sign in with browser",
+    const settingsBtn = btnGroup.createEl("button", {
+      text: "Open Iris Mail settings",
       cls: "mod-cta",
     });
-    browserBtn.addEventListener("click", onBrowserSignIn);
-
-    const deviceBtn = btnGroup.createEl("button", {
-      text: "Sign in with device code",
-    });
-    deviceBtn.addEventListener("click", onDeviceCodeSignIn);
+    settingsBtn.addEventListener("click", onOpenSettings);
   }
 
   showLoading(): void {

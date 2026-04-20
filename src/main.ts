@@ -1,49 +1,52 @@
 import { Plugin, WorkspaceLeaf, Notice } from "obsidian";
 import { InboxView } from "./views/InboxView";
 import { IrisMailSettingsTab } from "./settings/SettingsTab";
-import { AuthProvider } from "./auth/AuthProvider";
-import { GraphMailApi } from "./graph/GraphMailApi";
+import { AccountRegistry } from "./auth/AccountRegistry";
+import { MailDispatcher } from "./mail/MailDispatcher";
 import { EmailStore } from "./store/EmailStore";
 import {
   VIEW_TYPE_IRIS_MAIL,
   ICON_NAME,
   DEFAULT_SETTINGS,
+  CACHE_STORAGE_KEY,
 } from "./constants";
 import { logger, setDebugEnabled } from "./utils/logger";
 import { setRelayApp } from "./utils/claudeApi";
-import type { AuthMethod, IrisMailSettings, AuthState, Message } from "./types";
+import { newAccountId } from "./utils/compositeId";
+import { encryptString, decryptString } from "./utils/safeStorage";
+import type {
+  Account,
+  AuthMethod,
+  IrisMailSettings,
+  Message,
+  MailProvider,
+} from "./types";
 
-/** Encrypt a string using Electron's safeStorage if available, else return as-is. */
+/**
+ * The Anthropic API key is stored with an "enc:" sentinel so older plaintext
+ * values are still readable on upgrade. Once round-tripped, future writes will
+ * always carry the prefix.
+ */
 function encryptApiKey(key: string): string {
   if (!key) return "";
-  try {
-    const { safeStorage } = require("electron");
-    if (safeStorage.isEncryptionAvailable()) {
-      return "enc:" + safeStorage.encryptString(key).toString("base64");
-    }
-  } catch { /* safeStorage unavailable */ }
-  return key;
+  return "enc:" + encryptString(key);
 }
 
-/** Decrypt a string using Electron's safeStorage if it was encrypted. */
 function decryptApiKey(stored: string): string {
   if (!stored) return "";
-  if (stored.startsWith("enc:")) {
-    try {
-      const { safeStorage } = require("electron");
-      return safeStorage.decryptString(Buffer.from(stored.slice(4), "base64"));
-    } catch {
-      logger.warn("Main", "Failed to decrypt API key — safeStorage may be unavailable");
-      return "";
-    }
+  if (!stored.startsWith("enc:")) return stored;
+  try {
+    return decryptString(stored.slice(4));
+  } catch {
+    logger.warn("Main", "Failed to decrypt API key");
+    return "";
   }
-  return stored;
 }
 
 export default class IrisMailPlugin extends Plugin {
   settings: IrisMailSettings = DEFAULT_SETTINGS;
-  authProvider!: AuthProvider;
-  mailApi!: GraphMailApi;
+  accounts!: AccountRegistry;
+  mailApi!: MailDispatcher;
   store!: EmailStore;
   private refreshIntervalId: number | null = null;
   private ribbonIconEl: HTMLElement | null = null;
@@ -59,16 +62,9 @@ export default class IrisMailPlugin extends Plugin {
     this.store = new EmailStore(this);
     await this.store.load();
 
-    this.authProvider = new AuthProvider();
-    this.mailApi = new GraphMailApi(this.authProvider);
-
-    if (this.settings.clientId) {
-      try {
-        await this.authProvider.initialize(this.settings);
-      } catch (e) {
-        logger.error("Auth", "Failed to initialize auth", e);
-      }
-    }
+    this.mailApi = new MailDispatcher();
+    this.accounts = new AccountRegistry(this.mailApi);
+    await this.accounts.initializeAll(this.settings.accounts, this.settings);
 
     this.registerView(
       VIEW_TYPE_IRIS_MAIL,
@@ -87,18 +83,6 @@ export default class IrisMailPlugin extends Plugin {
     });
 
     this.addCommand({
-      id: "iris-login",
-      name: "Sign in to Outlook",
-      callback: () => this.handleLogin(),
-    });
-
-    this.addCommand({
-      id: "iris-logout",
-      name: "Sign out of Outlook",
-      callback: () => this.handleLogout(),
-    });
-
-    this.addCommand({
       id: "iris-refresh",
       name: "Refresh Iris Mail",
       callback: () => this.refreshAllViews(),
@@ -108,8 +92,7 @@ export default class IrisMailPlugin extends Plugin {
 
     this.startAutoRefresh();
 
-    // Initial background badge update (doesn't require the view to be open)
-    if (this.authProvider.isSignedIn()) {
+    if (this.accounts.anySignedIn()) {
       void this.backgroundRefresh();
     }
   }
@@ -121,7 +104,7 @@ export default class IrisMailPlugin extends Plugin {
       void this.saveSettings();
     }
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_IRIS_MAIL);
-    this.authProvider?.destroy();
+    this.accounts?.destroyAll();
     this.store?.flush();
     this.stopAutoRefresh();
   }
@@ -141,50 +124,84 @@ export default class IrisMailPlugin extends Plugin {
     this.app.workspace.revealLeaf(leaf);
   }
 
-  private async ensureInitialized(): Promise<boolean> {
-    if (!this.settings.clientId) return false;
-    await this.authProvider.initialize(this.settings);
-    return true;
+  // --- Account management ---
+
+  /** Create a new account from the partial fields supplied by Settings UI. */
+  async createAccount(input: { label: string; provider: MailProvider }): Promise<Account> {
+    const defaultLabel = input.provider === "imap" ? "IMAP" : "Outlook";
+    const account: Account = {
+      id: newAccountId(),
+      label: input.label || defaultLabel,
+      provider: input.provider,
+      enabled: true,
+      ...(input.provider === "imap" ? { imapSecure: true, imapPort: 993 } : {}),
+    };
+    this.settings.accounts = [...this.settings.accounts, account];
+    await this.saveSettings();
+    await this.accounts.add(account, this.settings);
+    return account;
   }
 
-  async handleLogin(method?: AuthMethod): Promise<void> {
-    const useMethod = method || this.settings.authMethod;
+  /** Persist an edit to an existing account (label or credentials). */
+  async updateAccount(updated: Account): Promise<void> {
+    this.settings.accounts = this.settings.accounts.map(
+      (a) => a.id === updated.id ? updated : a,
+    );
+    await this.saveSettings();
+    this.accounts.updateAccount(updated);
+  }
+
+  async removeAccount(accountId: string): Promise<void> {
+    await this.accounts.remove(accountId);
+    this.settings.accounts = this.settings.accounts.filter((a) => a.id !== accountId);
+    await this.saveSettings();
+    this.refreshAllViews();
+  }
+
+  async loginAccount(accountId: string, method?: AuthMethod): Promise<void> {
+    const entry = this.accounts.get(accountId);
+    if (!entry) throw new Error(`No such account: ${accountId}`);
+    if (!this.accounts.hasCredentials(entry.account)) {
+      new Notice(`${entry.account.label}: missing client credentials.`);
+      return;
+    }
+    const useMethod = method || entry.account.authMethod || "auth-code";
     try {
-      if (!(await this.ensureInitialized())) return;
-      if (useMethod === "device-code") {
-        await this.doDeviceCodeLogin();
+      await entry.auth.initialize(this.settings);
+      if (useMethod === "device-code" && entry.auth.loginWithDeviceCode) {
+        await this.doDeviceCodeLogin(entry.auth);
       } else {
-        await this.authProvider.login(this.settings);
+        await entry.auth.login(this.settings);
       }
-      new Notice("Signed in to Outlook successfully.");
+      new Notice(`Signed in to ${entry.account.label}.`);
       this.refreshAllViews();
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      new Notice(`Outlook sign-in failed: ${msg}`);
+      new Notice(`${entry.account.label} sign-in failed: ${msg}`);
     }
   }
 
-  async handleLoginWithDeviceCode(): Promise<void> {
-    return this.handleLogin("device-code");
+  async logoutAccount(accountId: string): Promise<void> {
+    const entry = this.accounts.get(accountId);
+    if (!entry) return;
+    await entry.auth.logout();
+    new Notice(`Signed out of ${entry.account.label}.`);
+    this.refreshAllViews();
   }
 
-  async handleLoginWithAuthCode(): Promise<void> {
-    return this.handleLogin("auth-code");
-  }
-
-  private async doDeviceCodeLogin(): Promise<void> {
+  private async doDeviceCodeLogin(auth: { loginWithDeviceCode?: (s: IrisMailSettings, cb: (code: string, uri: string) => void) => Promise<void> }): Promise<void> {
+    if (!auth.loginWithDeviceCode) {
+      throw new Error("Provider does not support device-code sign-in.");
+    }
     let codeNotice: Notice | undefined;
     let copyNotice: Notice | undefined;
     try {
-      await this.authProvider.loginWithDeviceCode(
+      await auth.loginWithDeviceCode(
         this.settings,
         (code, verificationUri) => {
           const frag = document.createDocumentFragment();
           frag.appendText("Go to ");
-          const link = frag.createEl("a", {
-            text: verificationUri,
-            href: verificationUri,
-          });
+          const link = frag.createEl("a", { text: verificationUri, href: verificationUri });
           link.addEventListener("click", (e) => {
             e.preventDefault();
             navigator.clipboard.writeText(code);
@@ -208,19 +225,13 @@ export default class IrisMailPlugin extends Plugin {
     }
   }
 
-  async handleLogout(): Promise<void> {
-    await this.authProvider.logout();
-    new Notice("Signed out of Outlook.");
-    this.refreshAllViews();
-  }
+  // --- Settings persistence ---
 
   async loadSettings(): Promise<void> {
     const data = await this.loadData();
-    // Strip the EmailStore cache blob so it doesn't leak into the settings object
     const { __cache: _ignored, ...settingsData } = (data ?? {}) as Record<string, unknown>;
     this.settings = Object.assign({}, DEFAULT_SETTINGS, settingsData);
 
-    // Decrypt API key from storage
     if (this.settings.anthropicApiKey) {
       this.settings.anthropicApiKey = decryptApiKey(this.settings.anthropicApiKey);
     }
@@ -233,10 +244,8 @@ export default class IrisMailPlugin extends Plugin {
     const fixedModel = modelFixes[this.settings.claudeModel];
     if (fixedModel) {
       this.settings.claudeModel = fixedModel;
-      await this.saveSettings();
     }
 
-    // Enable debug logging if configured
     setDebugEnabled(!!this.settings.debugLogging);
 
     // Drop legacy triage fields if present
@@ -245,18 +254,74 @@ export default class IrisMailPlugin extends Plugin {
     delete legacy.triageGraph;
     delete legacy.triageTreeVersion;
     delete legacy.enableTriage;
+
+    // Migrate single-account settings → accounts[]
+    const migrated = this.migrateSingleAccountSettings(settingsData as Record<string, unknown>);
+    if (migrated || fixedModel) {
+      await this.saveSettings();
+    }
+  }
+
+  /**
+   * If the settings file is from the single-account era, build one Account from
+   * the old top-level fields and rename the corresponding token cache key in
+   * localStorage so the user doesn't have to sign in again.
+   *
+   * Returns true if any migration ran.
+   */
+  private migrateSingleAccountSettings(rawSettings: Record<string, unknown>): boolean {
+    if (this.settings.accounts.length > 0) return false;
+
+    const provider = rawSettings.provider as string | undefined;
+    const oldClientId = rawSettings.clientId as string | undefined;
+    if (!provider && !oldClientId) return false;
+
+    const account: Account = {
+      id: newAccountId(),
+      label: "Outlook",
+      provider: "outlook",
+      enabled: true,
+      clientId: rawSettings.clientId as string | undefined,
+      authority: rawSettings.authority as string | undefined,
+      authMethod: rawSettings.authMethod as AuthMethod | undefined,
+    };
+    this.settings.accounts = [account];
+
+    // Strip the legacy keys off the in-memory settings object.
+    const s = this.settings as unknown as Record<string, unknown>;
+    delete s.provider;
+    delete s.clientId;
+    delete s.authority;
+    delete s.authMethod;
+
+    // Rename the localStorage token cache so the user stays signed in.
+    try {
+      const old = localStorage.getItem(CACHE_STORAGE_KEY);
+      if (old !== null) {
+        localStorage.setItem(`${CACHE_STORAGE_KEY}:${account.id}`, old);
+        localStorage.removeItem(CACHE_STORAGE_KEY);
+      }
+    } catch (err) {
+      logger.warn("Main", "Failed to migrate token storage key", err);
+    }
+
+    logger.info("Main", `Migrated legacy single-account settings to account ${account.id}`);
+    return true;
   }
 
   async saveSettings(): Promise<void> {
-    // Encrypt API key before writing to disk
     const toSave = { ...this.settings };
     if (toSave.anthropicApiKey && !toSave.anthropicApiKey.startsWith("enc:")) {
       toSave.anthropicApiKey = encryptApiKey(toSave.anthropicApiKey);
     }
-    // Merge into existing data so we don't clobber the EmailStore cache
     const existing = ((await this.loadData()) ?? {}) as Record<string, unknown>;
     const merged: Record<string, unknown> = { ...existing, ...toSave };
     if (existing.__cache !== undefined) merged.__cache = existing.__cache;
+    // Strip any lingering legacy single-account fields.
+    delete merged.provider;
+    delete merged.clientId;
+    delete merged.authority;
+    delete merged.authMethod;
     await this.saveData(merged);
   }
 
@@ -288,20 +353,14 @@ export default class IrisMailPlugin extends Plugin {
       return;
     }
 
-    if (!this.authProvider.isSignedIn()) return;
+    if (!this.accounts.anySignedIn()) return;
 
     try {
-      const folders = await this.mailApi.listFolders();
-      const inbox = folders.find(
-        (f) => f.displayName?.toLowerCase() === "inbox",
-      );
-      if (!inbox?.id) return;
-
-      const filter =
-        !this.settings.showReadEmails ? "isRead eq false" : undefined;
-      const response = await this.mailApi.listMessages(inbox.id, {
+      // The dispatcher merges every account's inbox; the folderId arg is
+      // ignored because each provider resolves its own inbox internally.
+      const response = await this.mailApi.listMessages("", {
         top: this.settings.pageSize,
-        filter,
+        unreadOnly: !this.settings.showReadEmails,
       });
 
       const messages = response.value;
@@ -333,7 +392,6 @@ export default class IrisMailPlugin extends Plugin {
   updateBadge(count: number): void {
     if (!this.ribbonIconEl) return;
 
-    // -1 signals a settings change — ask the active view to re-sync
     if (count < 0) {
       for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_IRIS_MAIL)) {
         (leaf.view as InboxView).syncBadge();
@@ -365,10 +423,9 @@ export default class IrisMailPlugin extends Plugin {
       this.registerInterval(this.refreshIntervalId);
     }
 
-    // Refresh badge when Obsidian regains focus (throttled to 30 s)
     this.visibilityHandler = () => {
       if (document.visibilityState !== "visible") return;
-      if (!this.authProvider.isSignedIn()) return;
+      if (!this.accounts.anySignedIn()) return;
       const elapsed = Date.now() - this.lastBackgroundRefreshAt;
       if (elapsed < 30_000) return;
       void this.backgroundRefresh();

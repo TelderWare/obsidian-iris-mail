@@ -15,6 +15,10 @@ interface MessageViewerCallbacks {
   onBatchMarkAsRead: (ids: Set<string>) => void;
   /** Batch mark selected messages as unread. */
   onBatchMarkAsUnread: (ids: Set<string>) => void;
+  /** Move a single message to the provider's trash folder. */
+  onDeleteMessage: (msg: Message) => void;
+  /** Batch-delete selected messages. */
+  onBatchDelete: (ids: Set<string>) => void;
   /** Batch assign a tag to selected messages. */
   onBatchTag: (ids: Set<string>, tag: string) => void;
   /** Bulk deny tag: remove tag from all selected, merge into formula, refine prompt. */
@@ -100,7 +104,6 @@ export class MessageViewer {
     strippedHtml: string,
   ): void {
     const sameMessage = msg.id != null && msg.id === this.currentMessageId;
-    const hadPrevious = !sameMessage && this.currentMsg !== null;
 
     this.currentMessageId = msg.id || null;
     this.currentMsg = msg;
@@ -110,77 +113,7 @@ export class MessageViewer {
       this.showingProcessed = false;
     }
 
-    if (hadPrevious) {
-      this.animateSwap(() => this.rebuildView());
-    } else {
-      this.rebuildView();
-    }
-  }
-
-  /**
-   * Cross-fade + slight vertical slide when swapping from one message to
-   * another. Analogous to the list FLIP animation: the outgoing content
-   * collapses upward while the incoming content rises into place, both over
-   * the same 220ms window.
-   */
-  private animateSwap(rebuild: () => void): void {
-    if (
-      typeof window !== "undefined"
-      && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
-    ) {
-      rebuild();
-      return;
-    }
-    const DURATION = 220;
-    const container = this.containerEl;
-
-    const scrollTop = container.scrollTop;
-    const ghost = container.cloneNode(true) as HTMLElement;
-    ghost.removeClass("iris-message-viewer");
-    ghost.addClass("iris-viewer-ghost");
-    ghost.style.position = "absolute";
-    ghost.style.top = `${scrollTop}px`;
-    ghost.style.left = "0";
-    ghost.style.right = "0";
-    ghost.style.pointerEvents = "none";
-    ghost.style.zIndex = "2";
-    ghost.style.overflow = "hidden";
-
-    rebuild();
-    container.appendChild(ghost);
-
-    // Force reflow before applying transition targets.
-    void ghost.offsetHeight;
-    ghost.style.transition =
-      `transform ${DURATION}ms ease, opacity ${DURATION}ms ease`;
-    ghost.style.transform = "translateY(-12px)";
-    ghost.style.opacity = "0";
-
-    // Animate the incoming (rebuilt) children in.
-    const incoming = Array.from(container.children).filter(
-      (c) => c !== ghost,
-    ) as HTMLElement[];
-    for (const el of incoming) {
-      el.style.transition = "none";
-      el.style.transform = "translateY(12px)";
-      el.style.opacity = "0";
-    }
-    void container.offsetHeight;
-    for (const el of incoming) {
-      el.style.transition =
-        `transform ${DURATION}ms ease, opacity ${DURATION}ms ease`;
-      el.style.transform = "";
-      el.style.opacity = "";
-    }
-
-    setTimeout(() => {
-      ghost.remove();
-      for (const el of incoming) {
-        el.style.transition = "";
-        el.style.transform = "";
-        el.style.opacity = "";
-      }
-    }, DURATION + 40);
+    this.rebuildView();
   }
 
   /** Re-render the current message without resetting toggle state. */
@@ -263,6 +196,15 @@ export class MessageViewer {
     setIcon(unreadBtn, "mail");
     unreadBtn.addEventListener("click", () => {
       this.callbacks.onBatchMarkAsUnread(new Set(selectedIds));
+    });
+
+    const batchDeleteBtn = actions.createEl("button", {
+      cls: "iris-header-icon clickable-icon",
+      attr: { "aria-label": "Move to bin" },
+    });
+    setIcon(batchDeleteBtn, "trash-2");
+    batchDeleteBtn.addEventListener("click", () => {
+      this.callbacks.onBatchDelete(new Set(selectedIds));
     });
 
     // Bulk deny tag: pick which tag is wrong on these emails
@@ -464,6 +406,15 @@ export class MessageViewer {
         this.callbacks.onMarkAsUnread(msg);
       });
     }
+
+    const deleteBtn = actionsEl.createEl("button", {
+      cls: "iris-header-icon clickable-icon",
+      attr: { "aria-label": "Move to bin" },
+    });
+    setIcon(deleteBtn, "trash-2");
+    deleteBtn.addEventListener("click", () => {
+      this.callbacks.onDeleteMessage(msg);
+    });
 
     if (this.processedMarkdown) {
       const toggleBtn = actionsEl.createEl("button", {

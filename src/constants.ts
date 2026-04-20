@@ -6,10 +6,11 @@ export const ICON_NAME = "mail";
 export const GRAPH_SCOPES = ["Mail.ReadWrite", "User.Read"];
 export const MSAL_AUTHORITY_DEFAULT = "https://login.microsoftonline.com/common";
 
+/** localStorage key prefix for IMAP app passwords (one entry per account id). */
+export const IMAP_PASSWORD_STORAGE_KEY = "iris-mail-imap-password";
+
 export const DEFAULT_SETTINGS: IrisMailSettings = {
-  clientId: "",
-  authority: MSAL_AUTHORITY_DEFAULT,
-  authMethod: "auth-code",
+  accounts: [],
   redirectPort: 3847,
   refreshIntervalMinutes: 5,
   pageSize: 25,
@@ -28,10 +29,10 @@ export const DEFAULT_SETTINGS: IrisMailSettings = {
   tagPromptVersions: {},
   prefetchLimit: 10,
   resolveForwardedSender: false,
-  enableAutoItemDetection: true,
   eventNoteFolderPath: "Events",
   taskNoteFolderPath: "Tasks",
   itemDetectionPrompt: "",
+  senderRules: {},
   viewMode: "messages",
   sortNewestFirst: true,
   filterUnreadOnly: true,
