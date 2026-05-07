@@ -70,6 +70,7 @@ export class ImapMailApi implements MailApi {
         ? { seen: false }
         : { all: true };
       if (options.search) search.text = options.search;
+      if (options.since) search.since = options.since;
 
       const uids = (await client.search(search, { uid: true })) || [];
       const sorted = Array.isArray(uids) ? [...uids].sort((a, b) => b - a) : [];

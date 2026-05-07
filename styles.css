@@ -38,6 +38,10 @@
   display: none;
 }
 
+.iris-mail-container.iris-compact .iris-topbar {
+  display: none;
+}
+
 /* Compact-mode back button in the viewer header — hidden at normal sizes. */
 .iris-viewer-compact-back {
   display: none;
@@ -63,9 +67,11 @@
   color: var(--text-normal);
 }
 
-/* Top bar */
+/* Top bar — three columns so the search icon stays centered in the whole bar,
+   not just centered in the space left over after the box strip. */
 .iris-topbar {
-  display: flex;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
   align-items: center;
   gap: 4px;
   padding: 4px 8px;
@@ -73,11 +79,25 @@
   flex-shrink: 0;
 }
 
-.iris-topbar-right {
-  margin-left: auto;
+.iris-topbar-left {
   display: flex;
   align-items: center;
   gap: 4px;
+  min-width: 0;
+}
+
+.iris-topbar-center {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.iris-topbar-right {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  min-width: 0;
 }
 
 .iris-topbar-btn {
@@ -104,6 +124,78 @@
 .iris-topbar-btn.is-active {
   background: var(--interactive-accent);
   color: var(--text-on-accent);
+}
+
+/* Box strip — named views (In, Read, To-do, Junk, Secretary, + user boxes) */
+.iris-box-strip {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-wrap: wrap;
+}
+
+.iris-box-chip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.iris-box-chip:not(.is-active):hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.iris-box-chip.is-active,
+.iris-box-chip.is-active:hover {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+
+.iris-box-chip.is-active .iris-box-chip-icon,
+.iris-box-chip.is-active:hover .iris-box-chip-icon {
+  color: var(--text-on-accent) !important;
+}
+
+.iris-box-chip-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.iris-box-chip-count {
+  position: absolute;
+  top: 0;
+  right: 0;
+  min-width: 12px;
+  height: 12px;
+  padding: 0 2px;
+  border-radius: 6px;
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  font-size: 8px;
+  font-weight: 700;
+  line-height: 12px;
+  text-align: center;
+  pointer-events: none;
+  box-sizing: border-box;
+}
+
+.iris-box-chip.is-active .iris-box-chip-count {
+  background: var(--text-on-accent);
+  color: var(--interactive-accent);
+}
+
+.iris-box-chip-add {
+  color: var(--text-faint);
 }
 
 /* Filter expand-on-hover — parent auto-sizes from child widths */
@@ -267,6 +359,8 @@ input.iris-add-tag-input {
 /* Message / conversation list */
 .iris-message-list {
   flex: 1;
+  min-width: 0;
+  overflow-x: hidden;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
@@ -341,6 +435,25 @@ input.iris-add-tag-input {
   overflow: hidden;
   text-overflow: ellipsis;
   min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.iris-msg-pin-indicator {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-accent);
+  flex-shrink: 0;
+}
+.iris-msg-pin-indicator .svg-icon {
+  width: 12px;
+  height: 12px;
+}
+.iris-msg-row.is-pinned .iris-msg-sender-name > span:not(.iris-msg-pin-indicator) {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .iris-msg-badges {
@@ -477,6 +590,9 @@ input.iris-add-tag-input {
   color: var(--text-muted);
   font-size: 12px;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 
 
@@ -788,10 +904,13 @@ input.iris-add-tag-input {
   gap: 8px;
 }
 
-/* Load more */
-.iris-load-more {
+/* Load-more sentinel (infinite scroll trigger) */
+.iris-load-more-sentinel {
+  display: flex;
+  align-items: center;
+  justify-content: center;
   padding: 16px 8px;
-  text-align: center;
+  min-height: 32px;
 }
 
 /* Indicators */
@@ -1257,7 +1376,7 @@ input.iris-add-tag-input {
 }
 
 .iris-settings-tag-delete:hover {
-  background: var(--background-modifier-error-hover);
+  background: var(--background-modifier-hover);
   color: var(--text-error);
 }
 
@@ -1293,6 +1412,107 @@ input.iris-add-tag-input {
   height: 16px;
 }
 
+/* Tags quick-access modal — same layout as the settings tag list. */
+.iris-tags-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding-right: 28px;
+}
+
+.iris-tags-modal-header h3 {
+  margin: 0;
+}
+
+.iris-tags-modal-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.iris-tags-modal-empty {
+  padding: 16px 8px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.iris-tags-modal-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--background-modifier-hover);
+  font-size: 13px;
+  color: var(--text-normal);
+  cursor: pointer;
+}
+
+.iris-tags-modal-item:hover {
+  background: var(--background-modifier-active-hover);
+}
+
+.iris-tags-modal-item.needs-description {
+  background: var(--background-modifier-error-hover, rgba(210, 153, 34, 0.08));
+  border: 1px solid var(--text-warning, #d29922);
+}
+
+.iris-tags-modal-icon {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-muted);
+}
+
+.iris-tags-modal-icon svg {
+  width: 16px;
+  height: 16px;
+}
+
+.iris-tags-modal-name {
+  flex: 1;
+  font-weight: 500;
+}
+
+.iris-tags-modal-warn {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-warning, #d29922);
+}
+
+.iris-tags-modal-warn svg {
+  width: 14px;
+  height: 14px;
+}
+
+.iris-tags-modal-delete {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  cursor: pointer;
+  color: var(--text-faint);
+  background: none;
+  border: none;
+}
+
+.iris-tags-modal-delete:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-error);
+}
+
+.iris-tags-modal-delete svg {
+  width: 14px;
+  height: 14px;
+}
+
 /* Batch action panel */
 .iris-batch-panel {
   display: flex;
@@ -1315,330 +1535,6 @@ input.iris-add-tag-input {
 .iris-batch-actions {
   display: flex;
   gap: 8px;
-}
-
-/* ── Detected Items Panel ─────────────────────────── */
-
-.iris-detected-items-bottom {
-  margin-top: auto;
-}
-
-.iris-detected-items-panel {
-  padding: 0 16px 12px;
-}
-
-.iris-detected-items-reload-row {
-  display: flex;
-  justify-content: flex-end;
-  padding: 4px 16px;
-}
-
-.iris-detected-items-reload {
-  color: var(--text-muted);
-  padding: 4px;
-  border-radius: 4px;
-}
-
-.iris-detected-items-reload:hover {
-  color: var(--text-normal);
-  background: var(--background-modifier-hover);
-}
-
-.iris-detected-items-reload svg {
-  width: 14px;
-  height: 14px;
-}
-
-.iris-detected-items-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 8px;
-}
-
-.iris-detected-items-title {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-normal);
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.iris-detected-items-chevron {
-  display: inline-flex;
-  align-items: center;
-}
-
-.iris-detected-items-chevron svg {
-  width: 14px;
-  height: 14px;
-  color: var(--text-muted);
-}
-
-.iris-detected-items-toggle {
-  font-size: 11px;
-  color: var(--text-muted);
-  background: none;
-  border: none;
-  cursor: pointer;
-  padding: 2px 6px;
-  border-radius: 4px;
-}
-
-.iris-detected-items-toggle:hover {
-  color: var(--text-normal);
-  background: var(--background-modifier-hover);
-}
-
-.iris-detected-items-list {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.iris-detected-item-card {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 8px 10px;
-  border-radius: 6px;
-  background: var(--background-primary);
-  border: 1px solid var(--background-modifier-border);
-}
-
-.iris-detected-item-card.is-accepted {
-  opacity: 0.6;
-  border-color: var(--interactive-accent);
-}
-
-.iris-detected-item-card.is-dismissed {
-  opacity: 0.35;
-}
-
-.iris-detected-item-icon {
-  flex-shrink: 0;
-  display: inline-flex;
-  align-items: center;
-  color: var(--text-muted);
-  margin-top: 2px;
-}
-
-.iris-detected-item-icon svg {
-  width: 16px;
-  height: 16px;
-}
-
-.iris-detected-item-content {
-  flex: 1;
-  min-width: 0;
-}
-
-.iris-detected-item-title {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-normal);
-  line-height: 1.3;
-}
-
-.iris-detected-item-meta {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 2px;
-  font-size: 11px;
-  color: var(--text-muted);
-}
-
-.iris-detected-item-desc {
-  margin-top: 3px;
-  font-size: 12px;
-  color: var(--text-muted);
-  line-height: 1.4;
-}
-
-.iris-detected-item-path {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  margin-top: 4px;
-  font-size: 11px;
-  color: var(--interactive-accent);
-}
-
-.iris-detected-item-path svg {
-  width: 12px;
-  height: 12px;
-}
-
-.iris-detected-item-actions {
-  flex-shrink: 0;
-  display: flex;
-  gap: 4px;
-  align-items: center;
-}
-
-.iris-detected-item-btn {
-  padding: 4px;
-  border-radius: 4px;
-  cursor: pointer;
-}
-
-.iris-detected-item-btn svg {
-  width: 14px;
-  height: 14px;
-}
-
-.iris-detected-item-accept:hover {
-  color: var(--interactive-accent);
-  background: var(--background-modifier-hover);
-}
-
-.iris-detected-item-dismiss:hover {
-  color: var(--text-error);
-  background: var(--background-modifier-hover);
-}
-
-.iris-detected-item-edit:hover {
-  color: var(--text-normal);
-  background: var(--background-modifier-hover);
-}
-
-/* Editing state */
-.iris-detected-item-card.is-editing {
-  flex-direction: column;
-  background: var(--background-primary);
-  border-color: color-mix(in srgb, var(--interactive-accent) 40%, transparent);
-  padding: 8px 10px;
-}
-
-.iris-detected-item-card.is-editing > .iris-detected-item-icon {
-  display: none;
-}
-
-.iris-detected-item-card.is-editing > .iris-detected-item-content {
-  width: 100%;
-}
-
-/* Inline editable inputs */
-.iris-detected-item-inline-input {
-  font-family: inherit;
-  color: var(--text-normal);
-  background: var(--background-secondary);
-  border: 1px solid transparent;
-  border-radius: 4px;
-  outline: none;
-  padding: 3px 8px;
-  box-sizing: border-box;
-}
-
-.iris-detected-item-inline-input:hover {
-  background: color-mix(in srgb, var(--background-secondary) 80%, var(--background-modifier-border));
-}
-
-.iris-detected-item-inline-input:focus {
-  border-color: var(--interactive-accent);
-  background: var(--background-primary);
-}
-
-/* Row containing title + meta inputs side by side */
-.iris-detected-item-edit-row {
-  display: flex;
-  gap: 4px;
-  align-items: center;
-}
-
-.iris-detected-item-inline-title {
-  flex: 1 1 0;
-  min-width: 0;
-  font-size: 13px;
-  font-weight: 600;
-  line-height: 1.3;
-}
-
-.iris-detected-item-inline-meta {
-  flex: 0 0 auto;
-  width: auto;
-  font-size: 12px;
-  color: var(--text-muted);
-  max-width: 150px;
-}
-
-.iris-detected-item-inline-meta[type="date"],
-.iris-detected-item-inline-meta[type="time"] {
-  max-width: 130px;
-}
-
-.iris-detected-item-inline-location {
-  display: block;
-  width: 100%;
-  margin-top: 4px;
-  font-size: 12px;
-  color: var(--text-muted);
-}
-
-select.iris-detected-item-inline-meta {
-  max-width: 100px;
-  cursor: pointer;
-}
-
-.iris-detected-item-inline-desc {
-  display: block;
-  width: 100%;
-  margin-top: 4px;
-  font-size: 12px;
-  color: var(--text-muted);
-  line-height: 1.4;
-  resize: vertical;
-  min-height: 36px;
-}
-
-.iris-detected-item-inline-actions {
-  display: flex;
-  gap: 4px;
-  margin-top: 6px;
-  justify-content: flex-end;
-}
-
-.iris-detected-item-inline-actions .iris-detected-item-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 11px;
-  padding: 4px 10px;
-  border-radius: 6px;
-  cursor: pointer;
-  border: none;
-  background: transparent;
-  color: var(--text-muted);
-}
-
-.iris-detected-item-inline-actions .iris-detected-item-btn svg {
-  width: 12px;
-  height: 12px;
-}
-
-.iris-detected-item-inline-actions .iris-detected-item-save {
-  background: var(--background-secondary);
-  color: var(--text-normal);
-}
-
-.iris-detected-item-inline-actions .iris-detected-item-save:hover {
-  background: var(--background-modifier-hover);
-}
-
-.iris-detected-item-inline-actions .iris-detected-item-accept {
-  background: var(--interactive-accent);
-  color: var(--text-on-accent);
-}
-
-.iris-detected-item-inline-actions .iris-detected-item-accept:hover {
-  filter: brightness(1.1);
-}
-
-.iris-detected-item-inline-actions .iris-detected-item-cancel:hover {
-  background: var(--background-modifier-hover);
-  color: var(--text-normal);
 }
 
 /* Inline Client ID entry (shown in sign-in prompt) */
@@ -1706,14 +1602,34 @@ select.iris-detected-item-inline-meta {
   margin-bottom: 12px;
 }
 
-.iris-msg-account-chip {
-  margin-left: 8px;
-  padding: 1px 6px;
-  font-size: 0.72em;
-  border-radius: 4px;
-  background: var(--background-modifier-border);
+.iris-box-saved-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.iris-box-saved-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+.iris-box-saved-help {
   color: var(--text-muted);
-  vertical-align: middle;
+  font-size: var(--font-ui-smaller);
 }
 
+/* --- Iris Homepage per-box widget ---
+ * The widget hosts the real InboxView MessageList, so row styling is inherited
+ * from `.iris-msg-row`. These rules provide just the small header bar and
+ * layout chrome around it. */
+.iris-homepage-widget-root {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.iris-homepage-widget-root > .iris-message-list {
+  flex: 1 1 auto;
+  min-height: 0;
+}
 

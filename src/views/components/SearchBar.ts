@@ -15,7 +15,7 @@ export class SearchBar {
 
     const iconBtn = this.wrapperEl.createEl("button", {
       cls: "iris-search-icon clickable-icon",
-      attr: { "aria-label": "Search" },
+      attr: { "aria-label": "Search (/)" },
     });
     setIcon(iconBtn, "search");
 
@@ -73,6 +73,12 @@ export class SearchBar {
   clear(): void {
     this.inputEl.value = "";
     this.collapse();
+  }
+
+  /** Expand and focus the search input (used by the `/` keyboard shortcut). */
+  focus(): void {
+    this.expand();
+    this.inputEl.focus();
   }
 
   private expand(): void {

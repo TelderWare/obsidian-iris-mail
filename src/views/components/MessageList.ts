@@ -1,5 +1,5 @@
 import { Menu, setIcon } from "obsidian";
-import type { Message, SenderGroup } from "../../types";
+import type { Message } from "../../types";
 import type { TagCacheEntry } from "../../store/types";
 import { formatRelativeDate } from "../../utils/dateFormat";
 import { getEnvelopeSender } from "../../utils/envelopeSender";
@@ -64,13 +64,13 @@ function resolvePreviewNames(
 
 interface MessageListCallbacks {
   onMessageSelect: (msg: Message) => void;
-  onSenderSelect: (sender: SenderGroup) => void;
-  onBack: () => void;
   onLoadMore: () => void;
   onMultiSelect: (selectedIds: Set<string>) => void;
   onEditNickname: (address: string, rawName: string) => void;
   /** Open the sender-rule editor (auto-bin, auto-tag, ...) for an address. */
   onEditSenderRule: (address: string, rawName: string) => void;
+  /** Add a sender rule that auto-bins all future messages from this address. */
+  onMarkSenderAsJunk: (address: string, rawName: string) => void;
 }
 
 export type NameResolver = (address: string, rawName: string) => string;
@@ -88,41 +88,13 @@ export type EffectiveSenderResolver = (msg: Message) => EffectiveSender;
 const PAGE_SIZE = 100;
 
 /** Render the shared "All caught up" empty state. */
-function renderEmptyState(parent: HTMLElement): void {
+function renderEmptyState(parent: HTMLElement, iconName = "inbox", title = "No messages"): void {
   const empty = parent.createDiv({ cls: "iris-empty-state" });
   const icon = empty.createDiv({ cls: "iris-empty-icon" });
-  setIcon(icon, "inbox");
-  empty.createDiv({ cls: "iris-empty-title", text: "No messages" });
+  setIcon(icon, iconName);
+  empty.createDiv({ cls: "iris-empty-title", text: title });
 }
 
-/** Render a "Show more" local pagination button. */
-function renderShowMoreButton(
-  parent: HTMLElement,
-  remainingCount: number,
-  onClick: () => void,
-): void {
-  const el = parent.createDiv({ cls: "iris-load-more" });
-  const btn = el.createEl("button", {
-    cls: "iris-header-icon clickable-icon",
-    attr: { "aria-label": `Show more (${remainingCount} remaining)` },
-  });
-  setIcon(btn, "chevrons-down");
-  btn.addEventListener("click", onClick);
-}
-
-/** Render a "Load more from server" button. */
-function renderLoadMoreButton(
-  parent: HTMLElement,
-  onClick: () => void,
-): void {
-  const el = parent.createDiv({ cls: "iris-load-more" });
-  const btn = el.createEl("button", {
-    cls: "iris-header-icon clickable-icon",
-    attr: { "aria-label": "Load more from server" },
-  });
-  setIcon(btn, "chevrons-down");
-  btn.addEventListener("click", onClick);
-}
 
 export class MessageList {
   private containerEl: HTMLElement;
@@ -135,7 +107,9 @@ export class MessageList {
   private tagCache = new Map<string, TagCacheEntry[]>();
   private tagIcons = new Map<string, string>();
   private tagColors = new Map<string, string>();
+  private tagDescriptions = new Map<string, string>();
   private hiddenListTags = new Set<string>();
+  private pinnedIds = new Set<string>();
 
   // Multi-selection state
   private selectedIds: Set<string> = new Set();
@@ -175,8 +149,16 @@ export class MessageList {
     this.tagColors = colors;
   }
 
+  setTagDescriptions(descriptions: Map<string, string>): void {
+    this.tagDescriptions = descriptions;
+  }
+
   setHiddenListTags(hidden: Set<string>): void {
     this.hiddenListTags = hidden;
+  }
+
+  setPinnedIds(ids: Set<string>): void {
+    this.pinnedIds = ids;
   }
 
   /** Fill the provided top-left slot with a tag badge for the message (if any non-hidden tags). */
@@ -189,9 +171,15 @@ export class MessageList {
     if (visible.length === 0) return;
     const first = visible[0];
     const iconName = this.tagIcons.get(first.tag) || "tag";
+    const tooltip = visible
+      .map((e) => {
+        const desc = this.tagDescriptions.get(e.tag);
+        return desc ? `${e.tag} — ${desc}` : e.tag;
+      })
+      .join("\n");
     const badge = slot.createSpan({
       cls: "iris-msg-tag-badge",
-      attr: { title: visible.map((e) => e.tag).join(", ") },
+      attr: { title: tooltip },
     });
     const color = this.tagColors.get(first.tag);
     if (color) badge.style.color = color;
@@ -237,6 +225,12 @@ export class MessageList {
             .setTitle("Create rule…")
             .setIcon("filter")
             .onClick(() => this.callbacks.onEditSenderRule(address, rawName)),
+        );
+        menu.addItem((item) =>
+          item
+            .setTitle("Block")
+            .setIcon("trash-2")
+            .onClick(() => this.callbacks.onMarkSenderAsJunk(address, rawName)),
         );
         menu.showAtMouseEvent(evt);
       });
@@ -312,6 +306,19 @@ export class MessageList {
     this.syncSelectionClasses();
   }
 
+  /** Select every currently rendered row. Returns the resulting selection. */
+  selectAll(): Set<string> {
+    this.selectedIds.clear();
+    for (const id of this.renderedOrder) {
+      if (id) this.selectedIds.add(id);
+    }
+    if (this.renderedOrder.length > 0) {
+      this.anchorId = this.renderedOrder[0];
+    }
+    this.syncSelectionClasses();
+    return new Set(this.selectedIds);
+  }
+
   /**
    * Update the highlighted single-selection row (used when the viewer is
    * driven programmatically, e.g. auto-advance to next unread) so the matching
@@ -332,6 +339,11 @@ export class MessageList {
     return new Set(this.selectedIds);
   }
 
+  /** Return the IDs of every rendered row, in visual order. */
+  getRenderedOrder(): readonly string[] {
+    return this.renderedOrder;
+  }
+
   private async transitionTo(
     _keepIds: Set<string>,
     rebuild: () => void,
@@ -343,16 +355,21 @@ export class MessageList {
   async renderFlatMessages(
     messages: Message[],
     hasMore: boolean,
+    empty?: { icon?: string; title?: string },
   ): Promise<void> {
     const keepIds = new Set(messages.map((m) => m.id || ""));
     const token = ++this.renderToken;
     await this.transitionTo(keepIds, () => {
       if (token !== this.renderToken) return;
-      this.rebuildFlatMessages(messages, hasMore);
+      this.rebuildFlatMessages(messages, hasMore, empty);
     });
   }
 
-  private rebuildFlatMessages(messages: Message[], hasMore: boolean): void {
+  private rebuildFlatMessages(
+    messages: Message[],
+    hasMore: boolean,
+    empty?: { icon?: string; title?: string },
+  ): void {
     this.containerEl.empty();
     this.rowRefs.clear();
     this.renderedOrder = [];
@@ -361,7 +378,7 @@ export class MessageList {
     this.renderedPageCount = 1;
 
     if (messages.length === 0) {
-      renderEmptyState(this.containerEl);
+      renderEmptyState(this.containerEl, empty?.icon, empty?.title);
       return;
     }
 
@@ -375,10 +392,12 @@ export class MessageList {
     for (const msg of visibleMessages) {
       const msgId = msg.id || "";
 
+      const isPinned = msg.id ? this.pinnedIds.has(msg.id) : false;
       const row = listEl.createDiv({
         cls:
           "iris-msg-row" +
           (!msg.isRead ? " is-unread" : "") +
+          (isPinned ? " is-pinned" : "") +
           (this.selectedIds.has(msgId) || msg.id === this.selectedMessageId
             ? " is-selected"
             : ""),
@@ -388,17 +407,18 @@ export class MessageList {
       const tagSlot = row.createDiv({ cls: "iris-msg-slot-tag" });
       this.renderTagSlot(tagSlot, msg);
 
-      // Row 1: sender name (+ optional account chip when multiple accounts)
+      // Row 1: sender name — prefixed with a pin icon when pinned.
       const nameEl = row.createDiv({ cls: "iris-msg-sender-name" });
-      this.renderSenderName(nameEl, msg);
-      if (msg._accountLabel) {
-        nameEl.createSpan({
-          cls: "iris-msg-account-chip",
-          text: msg._accountLabel,
+      if (isPinned) {
+        const pinEl = nameEl.createSpan({
+          cls: "iris-msg-pin-indicator",
+          attr: { title: "Pinned" },
         });
+        setIcon(pinEl, "pin");
       }
+      this.renderSenderName(nameEl, msg);
 
-      // Row 2: [attachment slot] [subject · date]
+      // Row 2: [attachment slot] [subject · date (on account)]
       const clipSlot = row.createDiv({ cls: "iris-msg-slot-attachment" });
       if (msg.hasAttachments) {
         const clip = clipSlot.createSpan({ cls: "iris-msg-attachment" });
@@ -408,7 +428,12 @@ export class MessageList {
       const parts: string[] = [];
       const subj = cleanSubject(msg.subject || "") || "(no subject)";
       parts.push(subj);
-      if (msg.receivedDateTime) parts.push(formatRelativeDate(msg.receivedDateTime));
+      if (msg.receivedDateTime) {
+        const date = formatRelativeDate(msg.receivedDateTime);
+        parts.push(msg._accountLabel ? `${date} on ${msg._accountLabel}` : date);
+      } else if (msg._accountLabel) {
+        parts.push(`on ${msg._accountLabel}`);
+      }
 
       row.createDiv({
         cls: "iris-msg-summary",
@@ -429,212 +454,49 @@ export class MessageList {
           this.selectedIds.add(msgId);
           this.anchorId = msgId;
           this.selectedMessageId = msg.id || null;
-          void this.renderFlatMessages(messages, hasMore);
+          void this.renderFlatMessages(messages, hasMore, empty);
           this.callbacks.onMessageSelect(msg);
         }
       });
     }
 
-    if (hasMoreLocal) {
-      renderShowMoreButton(
-        this.containerEl,
-        messages.length - visibleMessages.length,
-        () => { this.renderedPageCount++; void this.renderFlatMessages(messages, hasMore); },
-      );
-    }
-
-    if (hasMore) {
-      renderLoadMoreButton(this.containerEl, () => this.callbacks.onLoadMore());
+    if (hasMoreLocal || hasMore) {
+      this.attachLoadMoreSentinel(messages, hasMore, empty, hasMoreLocal);
     }
   }
 
-  /** Sender drilldown: messages from a single sender, with back header. */
-  async renderSenderMessages(
-    senderName: string,
+  /**
+   * Infinite-scroll sentinel: when it scrolls into view, reveal the next
+   * local page (cheap — already in memory) or fetch the next page from the
+   * server. The observer is disconnected as soon as it fires so the same
+   * sentinel can't double-trigger; the next render creates a fresh one.
+   */
+  private loadMoreObserver: IntersectionObserver | null = null;
+
+  private attachLoadMoreSentinel(
     messages: Message[],
-  ): Promise<void> {
-    const keepIds = new Set(messages.map((m) => m.id || ""));
-    const token = ++this.renderToken;
-    await this.transitionTo(keepIds, () => {
-      if (token !== this.renderToken) return;
-      this.rebuildSenderMessages(senderName, messages);
-    });
-  }
-
-  private rebuildSenderMessages(senderName: string, messages: Message[]): void {
-    this.containerEl.empty();
-    this.rowRefs.clear();
-    this.renderedOrder = [];
-
-    // Back header
-    const header = this.containerEl.createDiv({
-      cls: "iris-conv-header",
-    });
-    const backBtn = header.createEl("button", {
-      cls: "iris-conv-back clickable-icon",
-      attr: { "aria-label": "Back" },
-    });
-    setIcon(backBtn, "arrow-left");
-    backBtn.addEventListener("click", () => this.callbacks.onBack());
-
-    header.createSpan({
-      cls: "iris-conv-title",
-      text: senderName || "(unknown sender)",
-    });
-
-    const listEl = this.containerEl.createDiv({
-      cls: "iris-msg-list-inner iris-sender-drilldown",
-    });
-
-    for (const msg of messages) {
-      const msgId = msg.id || "";
-
-      const row = listEl.createDiv({
-        cls:
-          "iris-msg-row" +
-          (!msg.isRead ? " is-unread" : "") +
-          (this.selectedIds.has(msgId) || msg.id === this.selectedMessageId
-            ? " is-selected"
-            : ""),
-      });
-
-      // Top-left slot: tag badge (when message has tags)
-      const tagSlot = row.createDiv({ cls: "iris-msg-slot-tag" });
-      this.renderTagSlot(tagSlot, msg);
-
-      row.createDiv({
-        cls: "iris-msg-subject",
-        text: cleanSubject(msg.subject || "") || "(no subject)",
-      });
-
-      const clipSlot = row.createDiv({ cls: "iris-msg-slot-attachment" });
-      if (msg.hasAttachments) {
-        const clip = clipSlot.createSpan({ cls: "iris-msg-attachment" });
-        setIcon(clip, "paperclip");
-      }
-
-      row.createDiv({
-        cls: "iris-msg-date",
-        text: msg.receivedDateTime
-          ? formatRelativeDate(msg.receivedDateTime)
-          : "",
-      });
-
-      this.rowRefs.set(msgId, { el: row, messages: [msg], tagSlot });
-      this.renderedOrder.push(msgId);
-
-      row.addEventListener("click", (e: MouseEvent) => {
-        if (e.shiftKey && this.anchorId) {
-          e.preventDefault();
-          this.selectRange(msgId);
-          this.syncSelectionClasses();
-          this.callbacks.onMultiSelect(new Set(this.selectedIds));
-        } else {
-          this.selectedIds.clear();
-          this.selectedIds.add(msgId);
-          this.anchorId = msgId;
-          this.selectedMessageId = msg.id || null;
-          void this.renderSenderMessages(senderName, messages);
-          this.callbacks.onMessageSelect(msg);
-        }
-      });
-    }
-  }
-
-  /** Sender list: homepage in sender view mode. */
-  async renderSenders(
-    senders: SenderGroup[],
     hasMore: boolean,
-    msgFilter?: (m: Message) => boolean,
-  ): Promise<void> {
-    const keepIds = new Set(senders.map((s) => s.groupKey));
-    const token = ++this.renderToken;
-    await this.transitionTo(keepIds, () => {
-      if (token !== this.renderToken) return;
-      this.rebuildSenders(senders, hasMore, msgFilter);
-    });
-  }
-
-  private rebuildSenders(
-    senders: SenderGroup[],
-    hasMore: boolean,
-    msgFilter?: (m: Message) => boolean,
+    empty: { icon?: string; title?: string } | undefined,
+    hasMoreLocal: boolean,
   ): void {
-    this.containerEl.empty();
-    this.selectedMessageId = null;
-    this.rowRefs.clear();
-    this.selectedIds.clear();
-    this.anchorId = null;
-    this.renderedOrder = [];
-    this.renderedPageCount = 1;
+    const sentinel = this.containerEl.createDiv({ cls: "iris-load-more-sentinel" });
+    sentinel.createDiv({ cls: "iris-loading-spinner iris-loading-spinner--small" });
 
-    if (senders.length === 0) {
-      renderEmptyState(this.containerEl);
-      return;
-    }
+    this.loadMoreObserver?.disconnect();
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((e) => e.isIntersecting)) return;
+      observer.disconnect();
+      this.loadMoreObserver = null;
 
-    const listEl = this.containerEl.createDiv({
-      cls: "iris-msg-list-inner iris-sender-list",
-    });
-
-    const visibleSenders = senders.slice(0, PAGE_SIZE * this.renderedPageCount);
-    const hasMoreLocal = visibleSenders.length < senders.length;
-
-    for (const sender of visibleSenders) {
-      const visibleMessages = msgFilter
-        ? sender.messages.filter(msgFilter)
-        : sender.messages;
-      const isUnread = sender.unreadCount > 0;
-      const latest = sender.latestMessage;
-
-      const row = listEl.createDiv({
-        cls: "iris-msg-row" + (isUnread ? " is-unread" : ""),
-      });
-
-      // Top-left slot: tag badge for the latest message (when tagged)
-      const tagSlot = row.createDiv({ cls: "iris-msg-slot-tag" });
-      this.renderTagSlot(tagSlot, latest);
-
-      const nameEl = row.createDiv({ cls: "iris-msg-sender-name" });
-      this.createAddressSpan(nameEl, sender.address, sender.name || sender.address);
-
-      // Row 2: [count slot] [date]
-      const countN = visibleMessages.length;
-      const countSlot = row.createDiv({ cls: "iris-msg-slot-count" });
-      if (countN > 1) {
-        countSlot.createSpan({
-          cls: "iris-msg-count",
-          text: String(countN),
-        });
+      if (hasMoreLocal) {
+        this.renderedPageCount++;
+        void this.renderFlatMessages(messages, hasMore, empty);
+      } else if (hasMore) {
+        this.callbacks.onLoadMore();
       }
-
-      const dateStr = latest.receivedDateTime
-        ? formatRelativeDate(latest.receivedDateTime)
-        : "";
-      row.createDiv({
-        cls: "iris-msg-summary",
-        text: dateStr,
-      });
-
-      this.rowRefs.set(sender.groupKey, { el: row, messages: [latest, ...sender.messages.filter((m) => m !== latest)], tagSlot });
-      this.renderedOrder.push(sender.groupKey);
-
-      row.addEventListener("click", () => {
-        this.callbacks.onSenderSelect(sender);
-      });
-    }
-
-    if (hasMoreLocal) {
-      renderShowMoreButton(
-        this.containerEl,
-        senders.length - visibleSenders.length,
-        () => { this.renderedPageCount++; void this.renderSenders(senders, hasMore, msgFilter); },
-      );
-    }
-
-    if (hasMore) {
-      renderLoadMoreButton(this.containerEl, () => this.callbacks.onLoadMore());
-    }
+    }, { root: this.containerEl, rootMargin: "200px 0px" });
+    this.loadMoreObserver = observer;
+    observer.observe(sentinel);
   }
 
   renderLoggedOut(onOpenSettings: () => void): void {

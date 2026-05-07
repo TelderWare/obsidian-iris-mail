@@ -2,56 +2,38 @@ import { ItemView, WorkspaceLeaf, Notice, setIcon, Menu } from "obsidian";
 import type IrisMailPlugin from "../main";
 import {
   VIEW_TYPE_IRIS_MAIL,
+  COMPACT_MODE_CLASS,
   DEFAULT_CLAUDE_PROMPT,
   NICKNAME_PROMPT,
   NICKNAME_BATCH_PROMPT,
   TAG_CLASSIFY_PROMPT,
-  TAG_ICON_POOL,
-  ITEM_DETECTION_PROMPT,
   parseTagCategories,
   getTagVersion,
   bumpTagVersion,
-  setTagContradictions,
-  removeTagFromContradictions,
-  setTagPrecludesList,
-  setPrecludedByFor,
-  getPrecludedBy,
-  removeTagFromPrecludes,
 } from "../constants";
 import { MessageList } from "./components/MessageList";
 import { MessageViewer } from "./components/MessageViewer";
 import { NicknameModal } from "./components/NicknameModal";
 import { SenderRuleModal } from "./components/SenderRuleModal";
-import { CreateTagModal } from "./components/CreateTagModal";
 import { SearchBar } from "./components/SearchBar";
 import { Toolbar } from "./components/Toolbar";
-import { processEmailWithClaude, classifyEmailTagsYesNo, refineTagCriteria, generateNickname, generateNicknamesBatch, mergeEmailsToFormula, refineTagCriteriaBulk, extractNoteFromSelection, detectItemsInEmail, hasClaudeAccess, generateTagDescription, pickTagIcon, type TagCandidate } from "../utils/claudeApi";
+import { processEmailWithClaude, classifyEmailTagsYesNo, refineTagCriteria, generateNickname, generateNicknamesBatch, mergeEmailsToFormula, refineTagCriteriaBulk, extractNoteFromSelection, hasClaudeAccess, type TagCandidate } from "../utils/claudeApi";
 import type { NoteType, ExtractedNote } from "../utils/claudeApi";
 import { htmlToMarkdown } from "../utils/htmlToMarkdown";
-import { extractForwardedSender } from "../utils/extractForwardedSender";
+import { getEffectiveSender, makeEffectiveSenderResolver } from "../utils/effectiveSender";
 import { getEnvelopeSender } from "../utils/envelopeSender";
 import { logger } from "../utils/logger";
 import { EmailStore } from "../store/EmailStore";
 import { EmailClassifier } from "../services/EmailClassifier";
-import type { TagCacheEntry, DetectedItemEntry } from "../store/types";
 import type {
+  Box,
   Message,
   MessageListState,
-  SenderGroup,
 } from "../types";
+import { BoxEditModal } from "./components/BoxEditModal";
+import { TagsModal } from "./components/TagsModal";
 import type { MailListResponse } from "../mail/MailApi";
-
-/**
- * Normalize "LastName, FirstName" to "FirstName LastName".
- * Leaves other formats untouched.
- */
-function normalizeName(raw: string): string {
-  // Strip Outlook delegate suffix, e.g. "Name (via Institution)"
-  let name = raw.replace(/\s*\(via\s+[^)]+\)\s*$/i, "").trim();
-  const m = name.match(/^([^,]+),\s*(.+)$/);
-  if (m) name = `${m[2]} ${m[1]}`;
-  return name;
-}
+import { normalizeName } from "../utils/nameResolve";
 
 export class InboxView extends ItemView {
   private plugin: IrisMailPlugin;
@@ -59,7 +41,6 @@ export class InboxView extends ItemView {
   private messageViewer!: MessageViewer;
   private searchBar!: SearchBar;
   private toolbar!: Toolbar;
-  private compactResizeObserver: ResizeObserver | null = null;
 
   private messageState: MessageListState = {
     messages: [],
@@ -68,17 +49,17 @@ export class InboxView extends ItemView {
     searchQuery: "",
   };
 
-  // View mode: flat messages (default) or senders
-  private viewMode!: "messages" | "senders";
-  private senderGroups: SenderGroup[] = [];
-  private activeSender: SenderGroup | null = null;
-  private viewModeToggleBtn!: HTMLButtonElement;
   private sortNewestFirst!: boolean;
   private sortToggleBtn!: HTMLButtonElement;
-  private filterWrap!: HTMLDivElement;
-  private filterUnreadOnly!: boolean;
-  private unreadOptBtn!: HTMLButtonElement;
-  private filterTags = new Set<string>();
+
+  // Boxes (named views replacing the old unread + tag filter bar)
+  private selectedBoxId!: string;
+  private boxStripEl!: HTMLDivElement;
+  private todoIds = new Set<string>();
+  private junkIds = new Set<string>();
+  private pinnedIds = new Set<string>();
+  private classifierUnsubscribe: (() => void) | null = null;
+  private todosUnsubscribe: (() => void) | null = null;
 
   private selectedMessageId: string | null = null;
   private lastStrippedHtml: string = "";
@@ -89,26 +70,31 @@ export class InboxView extends ItemView {
   // In-memory caches
   private processedCache = new Map<string, string>();
   private nicknameCache = new Map<string, string>();
-  private detectedItemsCache = new Map<string, DetectedItemEntry[]>();
-
-  // Convenience accessors for classifier caches
-  private get tagCache() { return this.classifier.tags; }
-  private tagWrap!: HTMLDivElement;
-  private topBar!: HTMLDivElement;
+  // Render batching — coalesce multiple state changes into one paint.
+  private pendingRender: { regroup?: boolean; list?: boolean; tags?: boolean } = {};
+  private renderScheduled = false;
 
   // Prefetch state
   private prefetchGeneration = 0;
   private prefetchAllPromise: Promise<void> | null = null;
-  private prefetchInflight = new Set<string>();
+  /** Message IDs currently being summarized by Claude (prefetch or interactive).
+   *  Unioned with the classifier's in-flight set to drive the Secretary box. */
+  private summarizeInflight = new Set<string>();
+
+  private markSummarizing(id: string, on: boolean): void {
+    if (on) this.summarizeInflight.add(id);
+    else this.summarizeInflight.delete(id);
+    this.handleSecretaryUpdate();
+  }
 
   constructor(leaf: WorkspaceLeaf, plugin: IrisMailPlugin) {
     super(leaf);
     this.plugin = plugin;
     this.classifier = new EmailClassifier(plugin.store, () => plugin.settings);
     const s = plugin.settings;
-    this.viewMode = s.viewMode;
     this.sortNewestFirst = s.sortNewestFirst;
-    this.filterUnreadOnly = s.filterUnreadOnly;
+    this.selectedBoxId = s.selectedBoxId || "in";
+    this.classifierUnsubscribe = this.classifier.onInFlightChange(() => this.handleSecretaryUpdate());
   }
 
   getViewType(): string {
@@ -128,21 +114,6 @@ export class InboxView extends ItemView {
     container.empty();
     container.addClass("iris-mail-container");
 
-    // Collapse to single-pane layout (list OR viewer) when vertical space is tight.
-    const COMPACT_HEIGHT_PX = 700;
-    const updateCompact = () => {
-      container.toggleClass(
-        "iris-compact",
-        container.clientHeight > 0 && container.clientHeight < COMPACT_HEIGHT_PX,
-      );
-    };
-    if (this.compactResizeObserver) {
-      this.compactResizeObserver.disconnect();
-    }
-    this.compactResizeObserver = new ResizeObserver(() => updateCompact());
-    this.compactResizeObserver.observe(container);
-    updateCompact();
-
     if (!this.plugin.accounts.anySignedIn()) {
       this.renderSignInPrompt(container);
       return;
@@ -150,14 +121,29 @@ export class InboxView extends ItemView {
 
     this.reloadCaches();
     this.renderInboxUI(container);
+
+    this.todosUnsubscribe = this.plugin.onTodosChanged(() => this.handleExternalTodoChange());
+
+    // Wire keyboard shortcuts at document level so they fire regardless of
+    // which element inside the view has focus. The handler short-circuits
+    // when another view is active or the user is typing in a text widget.
+    this.registerDomEvent(document, "keydown", (evt: KeyboardEvent) => {
+      if (this.app.workspace.getActiveViewOfType(InboxView) !== this) return;
+      this.handleKeyDown(evt);
+    });
+
     await this.loadInbox();
   }
 
   async onClose(): Promise<void> {
     this.prefetchGeneration++;
-    if (this.compactResizeObserver) {
-      this.compactResizeObserver.disconnect();
-      this.compactResizeObserver = null;
+    if (this.classifierUnsubscribe) {
+      this.classifierUnsubscribe();
+      this.classifierUnsubscribe = null;
+    }
+    if (this.todosUnsubscribe) {
+      this.todosUnsubscribe();
+      this.todosUnsubscribe = null;
     }
     this.contentEl.empty();
   }
@@ -169,13 +155,76 @@ export class InboxView extends ItemView {
     // Re-read persistent caches without tearing down the UI
     this.reloadCaches();
 
-    // Reload data in-place (the existing topbar + message list stay mounted)
-    await this.loadInbox();
+    // Merge server state into the existing list instead of overwriting —
+    // preserves whatever the user has scrolled/paginated through.
+    await this.mergeRefresh();
+  }
+
+  /**
+   * Background-safe refresh: fetches the first page, merges by id into the
+   * current list (new items appended, existing items updated, scrolled-in
+   * pages preserved). Falls back to a full reload if we don't yet have any
+   * messages.
+   */
+  private async mergeRefresh(): Promise<void> {
+    if (!this.plugin.accounts.anySignedIn()) {
+      this.renderCurrentView();
+      return;
+    }
+    if (this.messageState.isLoading) return;
+    if (this.messageState.messages.length === 0) {
+      await this.loadInbox();
+      return;
+    }
+    // A search or filter narrowing is active — a merge would leak unrelated
+    // messages in. Defer to the normal search path.
+    if (this.messageState.searchQuery) {
+      await this.loadInbox();
+      return;
+    }
+
+    const showRead = this.plugin.settings.showReadEmails;
+    try {
+      const response = await this.plugin.mailApi.listMessages("", {
+        top: this.plugin.settings.pageSize,
+        unreadOnly: !showRead,
+        since: this.plugin.getSyncSince(),
+      });
+      this.plugin.store.applyReadState(response.value);
+
+      const byId = new Map<string, Message>();
+      for (const m of this.messageState.messages) {
+        if (m.id) byId.set(m.id, m);
+      }
+      for (const m of response.value) {
+        if (m.id) byId.set(m.id, m);
+      }
+      const merged = [...byId.values()].sort((a, b) => {
+        const ad = a.receivedDateTime ?? "";
+        const bd = b.receivedDateTime ?? "";
+        return bd.localeCompare(ad);
+      });
+      this.messageState.messages = this.plugin.store.mergePersistedMessages(
+        merged,
+        this.plugin.getSavedBoxes(),
+      );
+
+      this.applySenderRules();
+      this.regroupAndSync();
+      this.renderCurrentView();
+      this.startBackgroundProcessing();
+      this.plugin.setInboxMessages(this.messageState.messages);
+    } catch (err) {
+      // Background refresh failed — leave existing state untouched and re-render.
+      logger.warn("InboxView", "mergeRefresh failed", err);
+    }
   }
 
   private reloadCaches(): void {
-    this.classifier.reloadCaches();
     this.nicknameCache = this.plugin.store.getAllNicknames();
+    this.todoIds = this.plugin.store.getAllTodoIds();
+    this.junkIds = this.plugin.store.getAllJunkIds();
+    this.pinnedIds = this.plugin.store.getAllPinnedIds();
   }
 
   /** Display name of the signed-in user that owns this message, used as
@@ -233,23 +282,11 @@ export class InboxView extends ItemView {
   }
 
   private renderInboxUI(container: HTMLElement): void {
-    // Top bar: senders toggle (left) + search & refresh (right)
     const topBar = container.createDiv({ cls: "iris-topbar" });
 
-    // Senders view toggle (off = flat messages; on = grouped by sender)
-    this.viewModeToggleBtn = topBar.createEl("button", {
-      cls:
-        "iris-topbar-btn clickable-icon" +
-        (this.viewMode === "senders" ? " is-active" : ""),
-      attr: { "aria-label": "Group by sender" },
-    });
-    setIcon(this.viewModeToggleBtn, "users");
-    this.viewModeToggleBtn.addEventListener("click", () =>
-      this.handleViewModeToggle(),
-    );
-
-    // Sort toggle
-    this.sortToggleBtn = topBar.createEl("button", {
+    // Left: sort toggle + box strip
+    const leftControls = topBar.createDiv({ cls: "iris-topbar-left" });
+    this.sortToggleBtn = leftControls.createEl("button", {
       cls: "iris-topbar-btn clickable-icon",
       attr: { "aria-label": this.sortNewestFirst ? "Newest first" : "Oldest first" },
     });
@@ -263,31 +300,17 @@ export class InboxView extends ItemView {
       this.persistViewState();
     });
 
-    // Filter bar: icon + expandable toggle buttons
-    this.filterWrap = topBar.createDiv({ cls: "iris-filter-wrap has-options" });
-    const filterIcon = this.filterWrap.createEl("button", {
-      cls: "iris-topbar-btn clickable-icon",
-      attr: { "aria-label": "Filter" },
-    });
-    setIcon(filterIcon, "list-filter");
+    // Box strip: named views (In, Read, To-do, Junk, Secretary, + user boxes).
+    this.boxStripEl = leftControls.createDiv({ cls: "iris-box-strip" });
+    this.renderBoxStrip();
 
-    // Expandable filter toggles (revealed on hover)
-    this.unreadOptBtn = this.createFilterButton(
-      this.filterWrap, "mail", "Unread only",
-      () => this.filterUnreadOnly,
-      () => { this.filterUnreadOnly = !this.filterUnreadOnly; },
-    );
-
-    // Tag bar: existing tag icons + add button
-    this.topBar = topBar;
-    this.tagWrap = topBar.createDiv({ cls: "iris-tag-wrap" });
-    this.rebuildTagWrap();
-
-    const rightControls = topBar.createDiv({ cls: "iris-topbar-right" });
-
-    this.searchBar = new SearchBar(rightControls, {
+    // Center: search
+    const centerControls = topBar.createDiv({ cls: "iris-topbar-center" });
+    this.searchBar = new SearchBar(centerControls, {
       onSearch: (query: string) => this.handleSearch(query),
     });
+
+    const rightControls = topBar.createDiv({ cls: "iris-topbar-right" });
 
     // AI menu
     const aiMenuBtn = rightControls.createEl("button", {
@@ -303,32 +326,42 @@ export class InboxView extends ItemView {
       onRefresh: () => this.refresh(),
     });
 
+    // Tags — opens quick tag-management modal
+    const tagsBtn = rightControls.createEl("button", {
+      cls: "iris-topbar-btn clickable-icon",
+      attr: { "aria-label": "Tags" },
+    });
+    setIcon(tagsBtn, "tags");
+    tagsBtn.addEventListener("click", () => {
+      new TagsModal(this.plugin.app, this.plugin, {
+        onChange: () => this.handleTagsSettingsChanged(),
+      }).open();
+    });
+
     // Main area: message list + viewer (no sidebar)
     const mainEl = container.createDiv({ cls: "iris-main" });
     const rightPane = mainEl.createDiv({ cls: "iris-right-pane" });
 
     const nameResolver = (addr: string, raw: string) =>
       this.resolveName(addr, raw);
-    const effectiveSenderResolver = this.plugin.settings.resolveForwardedSender
-      ? (msg: Message) => this.getEffectiveSender(msg)
-      : null;
+    const effectiveSenderResolver = makeEffectiveSenderResolver(this.plugin);
 
     const listEl = rightPane.createDiv({ cls: "iris-message-list" });
     this.messageList = new MessageList(listEl, {
       onMessageSelect: (msg: Message) => this.handleMessageSelect(msg),
-      onSenderSelect: (sender: SenderGroup) =>
-        this.handleSenderSelect(sender),
-      onBack: () => this.handleBack(),
       onLoadMore: () => this.handleLoadMore(),
       onMultiSelect: (ids: Set<string>) => this.handleMultiSelect(ids),
       onEditNickname: (addr: string, rawName: string) => this.openNicknameModal(addr, rawName),
       onEditSenderRule: (addr: string, rawName: string) => this.openSenderRuleModal(addr, rawName),
+      onMarkSenderAsJunk: (addr: string, rawName: string) => this.markSenderAsJunk(addr, rawName),
     }, nameResolver, effectiveSenderResolver);
 
     const viewerEl = rightPane.createDiv({ cls: "iris-message-viewer" });
     this.messageViewer = new MessageViewer(viewerEl, this.plugin.app, {
       onMarkAsRead: (msg: Message) => this.handleMarkAsRead(msg),
       onMarkAsUnread: (msg: Message) => this.handleMarkAsUnread(msg),
+      onToggleTodo: (msg: Message) => this.handleToggleTodo(msg),
+      onTogglePin: (msg: Message) => this.handleTogglePin(msg),
       onTagChange: (msg: Message, tag: string | null) => this.handleTagChange(msg, tag),
       onRetagMessage: (msg) => this.handleRetagMessage(msg),
       onBatchMarkAsRead: (ids) => this.handleBatchMarkAsRead(ids),
@@ -338,23 +371,26 @@ export class InboxView extends ItemView {
       onDeleteMessage: (msg: Message) => this.handleDeleteMessage(msg),
       onBatchDelete: (ids) => this.handleBatchDelete(ids),
       onCreateNoteFromSelection: (text, noteType, msg) => this.handleCreateNoteFromSelection(text, noteType, msg),
-      onAcceptDetectedItem: (messageId, item) => this.handleAcceptDetectedItem(messageId, item),
-      onDismissDetectedItem: (messageId, itemId) => this.handleDismissDetectedItem(messageId, itemId),
-      onUpdateDetectedItem: (messageId, itemId, updates) => this.handleUpdateDetectedItem(messageId, itemId, updates),
-      onReloadDetectedItems: (messageId) => this.handleReloadDetectedItems(messageId),
       onReprocessMessage: (msg) => this.handleReprocessMessage(msg),
       onEditNickname: (addr: string, rawName: string) => this.openNicknameModal(addr, rawName),
+      onMarkSenderAsJunk: (addr: string, rawName: string) => this.markSenderAsJunk(addr, rawName),
       onDismiss: () => { this.messageViewer.clear(); },
     }, nameResolver);
     this.messageViewer.setEffectiveSenderResolver(effectiveSenderResolver);
     this.messageViewer.setTagCategories(this.getTagCategories());
     this.messageViewer.setTagIcons(this.getTagIconMap());
     this.messageViewer.setTagColors(this.getTagColorMap());
-    this.messageViewer.setTagCache(this.tagCache);
+    this.messageViewer.setTagDescriptions(this.getTagDescriptionMap());
+    this.messageViewer.setTagCache(this.plugin.store.getAllTags());
+    this.messageViewer.setTodoIds(this.todoIds);
+    this.messageViewer.setJunkIds(this.junkIds);
+    this.messageViewer.setPinnedIds(this.pinnedIds);
     this.messageList.setTagIcons(this.getTagIconMap());
     this.messageList.setTagColors(this.getTagColorMap());
-    this.messageList.setTagCache(this.tagCache);
+    this.messageList.setTagDescriptions(this.getTagDescriptionMap());
+    this.messageList.setTagCache(this.plugin.store.getAllTags());
     this.messageList.setHiddenListTags(this.getHiddenListTagSet());
+    this.messageList.setPinnedIds(this.pinnedIds);
     this.messageViewer.setPromptVersions(
       this.plugin.settings.tagPromptVersions || {},
     );
@@ -362,61 +398,310 @@ export class InboxView extends ItemView {
 
   // --- Private: shared helpers ---
 
-  /** Create a filter-option toggle button wired to applyFilters + persistViewState. */
-  private createFilterButton(
-    parent: HTMLElement,
-    icon: string,
-    label: string,
-    isActive: () => boolean,
-    toggle: () => void,
-  ): HTMLButtonElement {
-    const btn = parent.createEl("button", {
-      cls: "iris-filter-opt clickable-icon" + (isActive() ? " is-active" : ""),
-      attr: { "aria-label": label },
+  /** Rebuild the box strip UI. Call when box list, selection, or counts change. */
+  private renderBoxStrip(): void {
+    if (!this.boxStripEl) return;
+    this.boxStripEl.empty();
+
+    const boxes = this.plugin.settings.boxes || [];
+    const counts = this.computeBoxCounts();
+
+    for (const box of boxes) {
+      if (box.hidden) continue;
+      const isActive = box.id === this.selectedBoxId;
+      const chip = this.boxStripEl.createEl("button", {
+        cls: "iris-box-chip clickable-icon" + (isActive ? " is-active" : ""),
+        attr: { "aria-label": box.name, title: box.name },
+      });
+      const iconEl = chip.createSpan({ cls: "iris-box-chip-icon" });
+      setIcon(iconEl, box.icon || "inbox");
+      if (box.color) iconEl.style.color = box.color;
+      const count = counts.get(box.id) ?? 0;
+      if (count > 0) {
+        chip.createSpan({
+          cls: "iris-box-chip-count",
+          text: count > 99 ? "99+" : String(count),
+        });
+      }
+      chip.addEventListener("click", () => this.selectBox(box.id));
+      chip.addEventListener("contextmenu", (evt) => {
+        evt.preventDefault();
+        this.openBoxContextMenu(evt, box);
+      });
+    }
+
+    const addBtn = this.boxStripEl.createEl("button", {
+      cls: "iris-box-chip iris-box-chip-add clickable-icon",
+      attr: { "aria-label": "New box" },
     });
-    setIcon(btn, icon);
-    btn.addEventListener("click", () => {
-      toggle();
-      btn.toggleClass("is-active", isActive());
-      this.applyFilters();
-      this.persistViewState();
+    setIcon(addBtn, "plus");
+    addBtn.addEventListener("click", () => this.openBoxEditModal(null));
+    addBtn.addEventListener("contextmenu", (evt) => {
+      evt.preventDefault();
+      this.openAddBoxContextMenu(evt);
     });
-    return btn;
   }
 
-  /** Recompute sender groupings and update badge after any state change. */
+  /** Return the count of messages matching each box's predicate. */
+  private computeBoxCounts(): Map<string, number> {
+    const counts = new Map<string, number>();
+    const boxes = this.plugin.settings.boxes || [];
+    for (const box of boxes) counts.set(box.id, 0);
+    const inFlight = this.classifier.getInFlightIds();
+    for (const msg of this.messageState.messages) {
+      if (!msg.id) continue;
+      for (const box of boxes) {
+        if (this.messageMatchesBox(msg, box, inFlight)) {
+          counts.set(box.id, (counts.get(box.id) ?? 0) + 1);
+        }
+      }
+    }
+    return counts;
+  }
+
+  /**
+   * Predicate: does a message belong in the given box?
+   *
+   * Built-in boxes form an exclusive cascade: In > To-do > Junk > Read for
+   * the main list; Junk also trumps Secretary so a junked message stops
+   * showing up as "being processed" even if a background Claude call is
+   * still finishing. An unread message always lands in In regardless of any
+   * other state. Once read, a message goes to To-do if it carries an isTodo
+   * flag or any tag wired into the To-do box; otherwise to Junk under the
+   * same rule for the Junk box; otherwise to Read. User boxes match on
+   * their tag predicate and exclude messages already claimed by To-do or
+   * Junk.
+   */
+  private messageMatchesBox(msg: Message, box: Box, inFlight: Set<string>): boolean {
+    const id = msg.id;
+    if (!id) return false;
+
+    const msgTags = this.getMessageTagSet(id);
+    // Raw signals — computed independently of the In > To-do > Junk > Read
+    // cascade because Secretary needs to see "is this junk?" even for unread.
+    const junkSignal = this.junkIds.has(id) || this.hasBuiltinTagMatch(msgTags, "junk");
+    const todoSignal = this.todoIds.has(id) || this.hasBuiltinTagMatch(msgTags, "todo");
+
+    if (box.builtin === "secretary") {
+      if (junkSignal) return false;
+      return inFlight.has(id) || this.summarizeInflight.has(id);
+    }
+
+    const isUnread = !msg.isRead;
+    const effectiveTodo = !isUnread && todoSignal;
+    const effectiveJunk = !isUnread && !effectiveTodo && junkSignal;
+
+    switch (box.builtin) {
+      case "in":
+        return isUnread;
+      case "todo":
+        return effectiveTodo;
+      case "junk":
+        return effectiveJunk;
+      case "read":
+        return !isUnread && !effectiveTodo && !effectiveJunk;
+      default:
+        if (effectiveTodo || effectiveJunk) return false;
+        const boxTags = box.tags || [];
+        if (boxTags.length === 0) return false;
+        for (const t of boxTags) {
+          if (msgTags.has(t)) return true;
+        }
+        return false;
+    }
+  }
+
+  private getMessageTagSet(id: string): Set<string> {
+    const entries = this.plugin.store.getTags(id);
+    if (entries.length === 0) return new Set();
+    return new Set(entries.map((e) => e.tag));
+  }
+
+  /** True if the message carries any tag wired into the given built-in box. */
+  private hasBuiltinTagMatch(msgTags: Set<string>, builtin: "junk" | "todo"): boolean {
+    if (msgTags.size === 0) return false;
+    const box = (this.plugin.settings.boxes || []).find((b) => b.builtin === builtin);
+    if (!box || !box.tags || box.tags.length === 0) return false;
+    for (const t of box.tags) {
+      if (msgTags.has(t)) return true;
+    }
+    return false;
+  }
+
+  private selectBox(boxId: string): void {
+    if (this.selectedBoxId === boxId) return;
+    this.selectedBoxId = boxId;
+    this.renderBoxStrip();
+    this.applyFilters();
+    this.persistViewState();
+  }
+
+  /** Public entry point for external callers (e.g. homepage widgets). */
+  showBox(boxId: string): void {
+    this.selectBox(boxId);
+  }
+
+  private getSelectedBox(): Box | undefined {
+    return (this.plugin.settings.boxes || []).find((b) => b.id === this.selectedBoxId);
+  }
+
+  /** Refresh the Secretary count chip (and if Secretary is selected, the list). */
+  private handleSecretaryUpdate(): void {
+    if (!this.boxStripEl) return;
+    this.renderBoxStrip();
+    if (this.selectedBoxId === "secretary") this.renderCurrentView();
+  }
+
+  private openBoxContextMenu(evt: MouseEvent, box: Box): void {
+    const menu = new Menu();
+    menu.addItem((item) =>
+      item
+        .setTitle("Edit box…")
+        .setIcon("pencil")
+        .onClick(() => this.openBoxEditModal(box)),
+    );
+    menu.addItem((item) =>
+      item
+        .setTitle("Hide box")
+        .setIcon("eye-off")
+        .onClick(() => this.setBoxHidden(box.id, true)),
+    );
+    if (!box.builtin) {
+      menu.addItem((item) =>
+        item
+          .setTitle("Delete box")
+          .setIcon("trash-2")
+          .setWarning(true)
+          .onClick(() => this.deleteBox(box.id)),
+      );
+    }
+    menu.showAtMouseEvent(evt);
+  }
+
+  /** Right-click menu on the "+" button — lists any hidden boxes for restore. */
+  private openAddBoxContextMenu(evt: MouseEvent): void {
+    const boxes = this.plugin.settings.boxes || [];
+    const hidden = boxes.filter((b) => b.hidden);
+    if (hidden.length === 0) {
+      this.openBoxEditModal(null);
+      return;
+    }
+    const menu = new Menu();
+    menu.addItem((item) =>
+      item
+        .setTitle("New box…")
+        .setIcon("plus")
+        .onClick(() => this.openBoxEditModal(null)),
+    );
+    menu.addSeparator();
+    for (const box of hidden) {
+      menu.addItem((item) =>
+        item
+          .setTitle(`Show ${box.name}`)
+          .setIcon(box.icon || "inbox")
+          .onClick(() => this.setBoxHidden(box.id, false)),
+      );
+    }
+    menu.showAtMouseEvent(evt);
+  }
+
+  private setBoxHidden(id: string, hidden: boolean): void {
+    const boxes = [...(this.plugin.settings.boxes || [])];
+    const idx = boxes.findIndex((b) => b.id === id);
+    if (idx < 0) return;
+    boxes[idx] = { ...boxes[idx], hidden: hidden || undefined };
+    this.plugin.settings.boxes = boxes;
+    void this.plugin.saveSettings();
+    // If the hidden box was selected, fall back to the first visible box.
+    if (hidden && this.selectedBoxId === id) {
+      const fallback = boxes.find((b) => !b.hidden);
+      this.selectedBoxId = fallback?.id ?? "in";
+      this.applyFilters();
+    }
+    this.renderBoxStrip();
+  }
+
+  private openBoxEditModal(existing: Box | null): void {
+    new BoxEditModal(this.plugin.app, {
+      initial: existing || undefined,
+      existingIds: new Set((this.plugin.settings.boxes || []).map((b) => b.id)),
+      availableTags: this.getTagCategories(),
+      onSubmit: (draft) => {
+        const boxes = [...(this.plugin.settings.boxes || [])];
+        if (existing) {
+          const idx = boxes.findIndex((b) => b.id === existing.id);
+          if (idx >= 0) boxes[idx] = { ...boxes[idx], ...draft, id: existing.id, builtin: existing.builtin };
+        } else {
+          const newBox: Box = { ...draft, id: draft.id || `user-${Date.now()}` };
+          boxes.push(newBox);
+        }
+        this.plugin.settings.boxes = boxes;
+        void this.plugin.saveSettings();
+        this.renderBoxStrip();
+        if (this.selectedBoxId === (existing?.id ?? "")) this.renderCurrentView();
+      },
+    }).open();
+  }
+
+  private deleteBox(id: string): void {
+    const boxes = (this.plugin.settings.boxes || []).filter((b) => b.id !== id);
+    this.plugin.settings.boxes = boxes;
+    if (this.selectedBoxId === id) this.selectedBoxId = "in";
+    void this.plugin.saveSettings();
+    this.renderBoxStrip();
+    this.applyFilters();
+  }
+
+  /** Update the badge and box strip after any state change. */
   private regroupAndSync(): void {
-    this.senderGroups = this.groupByEffectiveSender(this.messageState.messages);
     this.syncBadge();
+    this.renderBoxStrip();
   }
 
   /** Push the current tag cache to the viewer and refresh list row badges in place. */
   private syncTagCacheViews(): void {
-    this.messageViewer.setTagCache(this.tagCache);
+    const tags = this.plugin.store.getAllTags();
+    this.messageViewer.setTagCache(tags);
+    this.messageList.setTagCache(tags);
     this.messageList.refreshTagBadges();
   }
 
-  /** Push tag icon/color maps to both viewer and list, then refresh list badges. */
-  private syncTagMetadataViews(): void {
-    const icons = this.getTagIconMap();
-    const colors = this.getTagColorMap();
-    this.messageViewer.setTagIcons(icons);
-    this.messageViewer.setTagColors(colors);
-    this.messageList.setTagIcons(icons);
-    this.messageList.setTagColors(colors);
-    this.messageList.refreshTagBadges();
+  /**
+   * Coalesce a render pass. Several state-change helpers need to update the
+   * badge/box strip, re-render the list, or push fresh tag data to children.
+   * When called multiple times in the same tick (e.g. inside a batch loop)
+   * only the union of requested work runs once on the next microtask.
+   */
+  private scheduleRender(opts: { regroup?: boolean; list?: boolean; tags?: boolean }): void {
+    if (opts.regroup) this.pendingRender.regroup = true;
+    if (opts.list) this.pendingRender.list = true;
+    if (opts.tags) this.pendingRender.tags = true;
+    if (this.renderScheduled) return;
+    this.renderScheduled = true;
+    queueMicrotask(() => this.flushRender());
+  }
+
+  private flushRender(): void {
+    const p = this.pendingRender;
+    this.pendingRender = {};
+    this.renderScheduled = false;
+    try {
+      if (p.tags) this.syncTagCacheViews();
+      if (p.regroup) this.regroupAndSync();
+      if (p.list) this.renderCurrentView();
+    } catch (err) {
+      logger.warn("InboxView", "Render flush failed", err);
+    }
   }
 
   /** Re-render the viewer for the currently selected message. */
   private renderSelectedMessage(msg: Message): void {
     if (!msg.id || this.selectedMessageId !== msg.id) return;
-    this.messageViewer.setDetectedItems(this.detectedItemsCache.get(msg.id) || []);
     this.messageViewer.render(msg, this.lastStrippedHtml);
   }
 
-  /** Reset drill-down/selection state and clear viewer. */
+  /** Clear list selection and viewer. */
   private clearDrillDown(): void {
-    this.activeSender = null;
     this.selectedMessageId = null;
     this.messageList.clearMultiSelection();
     this.messageViewer.clear();
@@ -441,10 +726,9 @@ export class InboxView extends ItemView {
       void call.catch((err) => this.rollbackReadState(id, !markAsRead, err));
     }
 
-    this.regroupAndSync();
     this.messageList.clearMultiSelection();
     this.messageViewer.clear();
-    this.renderCurrentView();
+    this.scheduleRender({ regroup: true, list: true });
   }
 
   /**
@@ -470,36 +754,12 @@ export class InboxView extends ItemView {
     try {
       // The dispatcher merges every account's Inbox; folderId is unused.
       await this.loadMessages("");
-      void this.syncLocalReadStateToServer();
     } catch (err: unknown) {
       if (!this.plugin.accounts.anySignedIn()) {
         this.renderCurrentView();
       } else {
         const msg = err instanceof Error ? err.message : String(err);
         new Notice(`Failed to load inbox: ${msg}`);
-      }
-    }
-  }
-
-  /**
-   * Push locally-tracked read states to the Graph API, then clear them
-   * from the local store (the server is now the source of truth).
-   */
-  private async syncLocalReadStateToServer(): Promise<void> {
-    const ids = this.plugin.store.getLocallyReadIds();
-    if (ids.length === 0) return;
-
-    logger.info("InboxView", `Syncing ${ids.length} local read states to server`);
-    const api = this.plugin.mailApi;
-
-    for (const id of ids) {
-      try {
-        await api.markAsRead(id);
-        this.plugin.store.clearLocalRead(id);
-      } catch (err) {
-        // Message may have been deleted server-side — just clear it
-        logger.warn("InboxView", `Failed to sync read state for ${id}`, err);
-        this.plugin.store.clearLocalRead(id);
       }
     }
   }
@@ -516,9 +776,13 @@ export class InboxView extends ItemView {
           top: this.plugin.settings.pageSize,
           search: searchQuery,
           unreadOnly: !showRead,
+          since: this.plugin.getSyncSince(),
         });
 
-      this.messageState.messages = response.value;
+      this.messageState.messages = this.plugin.store.mergePersistedMessages(
+        response.value,
+        this.plugin.getSavedBoxes(),
+      );
       this.plugin.store.applyReadState(this.messageState.messages);
       this.messageState.nextLink = response.nextLink;
       // Cache non-search list results so we can fall back on next failure.
@@ -529,6 +793,7 @@ export class InboxView extends ItemView {
       this.regroupAndSync();
       this.renderCurrentView();
       this.startBackgroundProcessing();
+      this.plugin.setInboxMessages(this.messageState.messages);
     } catch (err: unknown) {
       if (!this.plugin.accounts.anySignedIn()) {
         this.renderCurrentView();
@@ -538,11 +803,15 @@ export class InboxView extends ItemView {
           ? this.plugin.store.getMessageList(folderId, showRead)
           : undefined;
         if (cached) {
-          this.messageState.messages = cached.messages as Message[];
+          this.messageState.messages = this.plugin.store.mergePersistedMessages(
+            cached.messages as Message[],
+            this.plugin.getSavedBoxes(),
+          );
           this.plugin.store.applyReadState(this.messageState.messages);
           this.messageState.nextLink = cached.nextLink;
           this.regroupAndSync();
           this.renderCurrentView();
+          this.plugin.setInboxMessages(this.messageState.messages);
           const errMsg = err instanceof Error ? err.message : String(err);
           new Notice(`Offline — showing cached messages (${errMsg})`);
         } else {
@@ -583,40 +852,14 @@ export class InboxView extends ItemView {
       return;
     }
 
-    // Nothing unread left; if we were in a sender drill-down that's now empty,
-    // fall back to the top-level list.
-    if (this.activeSender) {
-      const updated = this.senderGroups.find(
-        (s) => s.groupKey === this.activeSender!.groupKey,
-      );
-      const remaining = updated
-        ? this.filterSenderMessages(updated.messages)
-        : [];
-      if (remaining.length === 0) {
-        this.handleBack();
-        return;
-      }
-      this.selectedMessageId = null;
-      this.messageViewer.clear();
-    }
+    this.selectedMessageId = null;
+    this.messageViewer.clear();
   }
 
-  /**
-   * Find the next unread message in the current view (sender drill-down or
-   * top-level flat messages list), in the active sort order.
-   */
+  /** Find the next unread message in the current list, in the active sort order. */
   private findNextUnread(currentId: string | null): Message | null {
     const dir = this.sortNewestFirst ? -1 : 1;
-    let src: Message[];
-    if (this.activeSender) {
-      const updated = this.senderGroups.find(
-        (s) => s.groupKey === this.activeSender!.groupKey,
-      );
-      src = updated?.messages || this.activeSender.messages;
-    } else {
-      src = this.messageState.messages;
-    }
-    const list = [...src].sort(
+    const list = [...this.messageState.messages].sort(
       (a, b) =>
         dir *
         (new Date(a.receivedDateTime || 0).getTime() -
@@ -624,6 +867,104 @@ export class InboxView extends ItemView {
     );
     for (const m of list) {
       if (!m.isRead && m.id !== currentId) return m;
+    }
+    return null;
+  }
+
+  /** Toggle the client-side to-do flag, auto-advance to next matching message. */
+  private handleToggleTodo(msg: Message): void {
+    if (!msg.id) return;
+    const id = msg.id;
+    const wasTodo = this.todoIds.has(id);
+    if (wasTodo) {
+      this.todoIds.delete(id);
+      this.plugin.store.unmarkTodo(id);
+    } else {
+      this.todoIds.add(id);
+      this.plugin.store.markTodo(id);
+      // Adding to to-do implies the user has triaged the message — mark it
+      // as read locally and on the server so it leaves the In box too.
+      if (!msg.isRead) {
+        msg.isRead = true;
+        const canonical = this.messageState.messages.find((m) => m.id === id);
+        if (canonical && canonical !== msg) canonical.isRead = true;
+        this.plugin.store.markRead(id);
+        void this.plugin.mailApi.markAsRead(id).catch((err) =>
+          this.rollbackReadState(id, false, err));
+      }
+    }
+    this.messageViewer.setTodoIds(this.todoIds);
+    this.renderBoxStrip();
+    this.advanceAfterStateChange(msg);
+    this.plugin.notifyTodosChanged();
+  }
+
+  /** Re-sync from the store after an external `clearTodo` (e.g. from Iris Tasks). */
+  private handleExternalTodoChange(): void {
+    const fresh = this.plugin.store.getAllTodoIds();
+    if (fresh.size === this.todoIds.size) {
+      let same = true;
+      for (const id of fresh) if (!this.todoIds.has(id)) { same = false; break; }
+      if (same) return;
+    }
+    this.todoIds = fresh;
+    this.messageViewer.setTodoIds(this.todoIds);
+    this.renderBoxStrip();
+  }
+
+  private handleTogglePin(msg: Message): void {
+    if (!msg.id) return;
+    const id = msg.id;
+    const wasPinned = this.pinnedIds.has(id);
+    if (wasPinned) {
+      this.pinnedIds.delete(id);
+      this.plugin.store.unmarkPinned(id);
+    } else {
+      this.pinnedIds.add(id);
+      // Persist the envelope so the pinned message re-appears even if it falls
+      // outside the next sync window or is excluded by the read-only filter.
+      this.plugin.store.markPinned(id, msg);
+    }
+    this.messageViewer.setPinnedIds(this.pinnedIds);
+    this.messageList.setPinnedIds(this.pinnedIds);
+    this.renderBoxStrip();
+    // Pin/unpin never exiles the message from its current box, so re-render in
+    // place rather than auto-advancing the way todo/junk do.
+    this.renderCurrentView();
+    this.plugin.setInboxMessages(this.messageState.messages);
+  }
+
+  /**
+   * After a state change that may have filtered the current message out of the
+   * selected box, re-render and advance to the next matching message.
+   */
+  private advanceAfterStateChange(msg: Message): void {
+    this.regroupAndSync();
+    const next = this.findNextBoxMatch(msg.id || null);
+    this.renderCurrentView();
+    if (next) {
+      void this.showMessageInViewer(next);
+    } else {
+      this.selectedMessageId = null;
+      this.messageViewer.clear();
+    }
+  }
+
+  /** Find the next message matching the selected box, in the active sort order. */
+  private findNextBoxMatch(currentId: string | null): Message | null {
+    const box = this.getSelectedBox();
+    if (!box) return null;
+    const dir = this.sortNewestFirst ? -1 : 1;
+    const list = [...this.messageState.messages].sort(
+      (a, b) =>
+        dir *
+        (new Date(a.receivedDateTime || 0).getTime() -
+          new Date(b.receivedDateTime || 0).getTime()),
+    );
+    const inFlight = this.classifier.getInFlightIds();
+    for (const m of list) {
+      if (m.id === currentId) continue;
+      if (this.messageMatchesBox(m, box, inFlight)) return m;
     }
     return null;
   }
@@ -681,7 +1022,6 @@ export class InboxView extends ItemView {
     } else {
       this.selectedMessageId = null;
       this.messageViewer.clear();
-      if (this.activeSender) this.handleBack();
     }
 
     void this.plugin.mailApi.deleteMessage(id).catch((err) => {
@@ -745,11 +1085,7 @@ export class InboxView extends ItemView {
   /** Find the next message after currentId in the active sort order. */
   private findNextMessage(currentId: string): Message | null {
     const dir = this.sortNewestFirst ? -1 : 1;
-    const src = this.activeSender
-      ? (this.senderGroups.find((s) => s.groupKey === this.activeSender!.groupKey)?.messages
-        ?? this.activeSender.messages)
-      : this.messageState.messages;
-    const list = [...src].sort(
+    const list = [...this.messageState.messages].sort(
       (a, b) =>
         dir *
         (new Date(a.receivedDateTime || 0).getTime() -
@@ -763,20 +1099,12 @@ export class InboxView extends ItemView {
   private handleBatchTag(ids: Set<string>, tag: string): void {
     const msgIds = this.resolveBatchMessageIds(ids);
     for (const msgId of msgIds) {
-      const existing = this.tagCache.get(msgId) || [];
-      if (existing.some((e) => e.tag === tag)) continue;
-      const entry: TagCacheEntry = {
-        messageId: msgId,
-        tag,
-        source: "manual",
-        taggedAt: Date.now(),
-      };
-      this.tagCache.set(msgId, [...existing, entry]);
+      if (this.plugin.store.getTags(msgId).some((e) => e.tag === tag)) continue;
       this.plugin.store.setTag(msgId, tag, "manual");
     }
-    this.syncTagCacheViews();
     this.messageList.clearMultiSelection();
     this.messageViewer.clear();
+    this.scheduleRender({ tags: true, regroup: true });
   }
 
   /** Bulk deny tag: remove tag from all selected, merge into formula, refine prompt. */
@@ -789,13 +1117,6 @@ export class InboxView extends ItemView {
 
     // Remove the denied tag from each message immediately
     for (const msgId of msgIds) {
-      const existing = this.tagCache.get(msgId) || [];
-      const updated = existing.filter((e) => e.tag !== tag);
-      if (updated.length === 0) {
-        this.tagCache.delete(msgId);
-      } else {
-        this.tagCache.set(msgId, updated);
-      }
       this.plugin.store.removeTag(msgId, tag);
 
       const msg = this.messageState.messages.find((m) => m.id === msgId);
@@ -805,9 +1126,9 @@ export class InboxView extends ItemView {
       }
     }
 
-    this.syncTagCacheViews();
     this.messageList.clearMultiSelection();
     this.messageViewer.clear();
+    this.scheduleRender({ tags: true, regroup: true });
 
     if (contents.length === 0) return;
 
@@ -833,11 +1154,6 @@ export class InboxView extends ItemView {
   /** Batch IDs are always message IDs now that the top-level list is flat. */
   private resolveBatchMessageIds(ids: Set<string>): string[] {
     return [...ids];
-  }
-
-  private handleBack(): void {
-    this.clearDrillDown();
-    this.renderCurrentView();
   }
 
   private async showMessageInViewer(msg: Message): Promise<void> {
@@ -897,7 +1213,6 @@ export class InboxView extends ItemView {
     if (this.selectedMessageId !== (msg.id || null)) return;
 
     this.lastStrippedHtml = stripped;
-    this.messageViewer.setDetectedItems(this.detectedItemsCache.get(msg.id!) || []);
     this.messageViewer.render(msg, stripped);
 
     // --- Processed markdown: L1 memory → L2 disk → Claude API ---
@@ -924,10 +1239,10 @@ export class InboxView extends ItemView {
     }
 
     // If prefetch is currently processing this message, wait for it
-    if (this.prefetchInflight.has(msgId)) {
+    if (this.summarizeInflight.has(msgId)) {
       this.messageViewer.showProcessingIndicator();
       const waitStart = Date.now();
-      while (this.prefetchInflight.has(msgId) && Date.now() - waitStart < 10000) {
+      while (this.summarizeInflight.has(msgId) && Date.now() - waitStart < 10000) {
         await new Promise((r) => setTimeout(r, 200));
       }
       if (this.selectedMessageId !== msgId) return;
@@ -958,6 +1273,7 @@ export class InboxView extends ItemView {
     // even when the body is sparse (e.g. meeting invitations, calendar events).
     const parsedContent = this.buildEmailContext(msg) + parsedBody;
 
+    this.markSummarizing(msgId, true);
     processEmailWithClaude(s.anthropicApiKey, s.claudeModel, effectivePrompt, parsedContent)
       .then(async (markdown) => {
         // Store raw markdown in memory
@@ -980,6 +1296,9 @@ export class InboxView extends ItemView {
         if (this.selectedMessageId === msgId) {
           this.messageViewer.hideProcessingIndicator();
         }
+      })
+      .finally(() => {
+        this.markSummarizing(msgId, false);
       });
   }
 
@@ -988,28 +1307,58 @@ export class InboxView extends ItemView {
     await this.loadMessages("");
   }
 
+  private isLoadingMore = false;
+
   private async handleLoadMore(): Promise<void> {
     if (!this.messageState.nextLink) return;
+    if (this.isLoadingMore) return;
+    this.isLoadingMore = true;
+
+    // Graph's `$filter=receivedDateTime ge X` can return an empty `value`
+    // with a non-null `@odata.nextLink` while it scans older pages. Drain
+    // those empty pages in one call so the sentinel doesn't flicker.
+    const MAX_EMPTY_PAGES = 10;
+    let emptyPages = 0;
+    const seen = new Set(this.messageState.messages.map((m) => m.id));
+    const collected: Message[] = [];
 
     try {
-      const response: MailListResponse<Message> =
-        await this.plugin.mailApi.listMessages("", {
-          nextLink: this.messageState.nextLink,
-        });
+      const showRead = this.plugin.settings.showReadEmails;
+      const since = this.plugin.getSyncSince();
+      const searchQuery = this.messageState.searchQuery || undefined;
+      while (this.messageState.nextLink) {
+        const response: MailListResponse<Message> =
+          await this.plugin.mailApi.listMessages("", {
+            nextLink: this.messageState.nextLink,
+            top: this.plugin.settings.pageSize,
+            unreadOnly: !showRead,
+            search: searchQuery,
+            since,
+          });
+        this.messageState.nextLink = response.nextLink;
 
-      this.plugin.store.applyReadState(response.value);
-      this.messageState.messages = [
-        ...this.messageState.messages,
-        ...response.value,
-      ];
-      this.messageState.nextLink = response.nextLink;
+        const fresh = response.value.filter((m) => m.id && !seen.has(m.id));
+        for (const m of fresh) seen.add(m.id!);
+        collected.push(...fresh);
+
+        if (fresh.length > 0) break;
+        emptyPages++;
+        if (emptyPages >= MAX_EMPTY_PAGES) break;
+      }
+
+      if (collected.length > 0) {
+        this.plugin.store.applyReadState(collected);
+        this.messageState.messages = [...this.messageState.messages, ...collected];
+      }
 
       this.regroupAndSync();
       this.renderCurrentView();
-      this.startBackgroundProcessing();
+      if (collected.length > 0) this.startBackgroundProcessing();
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       new Notice(`Failed to load more messages: ${msg}`);
+    } finally {
+      this.isLoadingMore = false;
     }
   }
 
@@ -1054,18 +1403,28 @@ export class InboxView extends ItemView {
 
   private persistViewState(): void {
     const s = this.plugin.settings;
-    s.viewMode = this.viewMode;
     s.sortNewestFirst = this.sortNewestFirst;
-    s.filterUnreadOnly = this.filterUnreadOnly;
+    s.selectedBoxId = this.selectedBoxId;
     void this.plugin.saveSettings();
   }
 
-  private handleViewModeToggle(): void {
-    this.viewMode = this.viewMode === "messages" ? "senders" : "messages";
-    this.viewModeToggleBtn.toggleClass("is-active", this.viewMode === "senders");
-    this.clearDrillDown();
-    this.renderCurrentView();
-    this.persistViewState();
+  /** Compute the filtered, sort-ordered list as currently displayed in the view.
+   *  Pinned messages always float to the top of the visible list, regardless
+   *  of which box is selected or the active date sort. Within the pinned and
+   *  non-pinned groups, the date sort applies normally. */
+  private getVisibleMessages(): Message[] {
+    const filtered = this.applyMessageFilters(this.messageState.messages);
+    const dir = this.sortNewestFirst ? -1 : 1;
+    const byDate = (a: Message, b: Message) =>
+      dir *
+      (new Date(a.receivedDateTime || 0).getTime() -
+        new Date(b.receivedDateTime || 0).getTime());
+    return [...filtered].sort((a, b) => {
+      const ap = a.id ? this.pinnedIds.has(a.id) : false;
+      const bp = b.id ? this.pinnedIds.has(b.id) : false;
+      if (ap !== bp) return ap ? -1 : 1;
+      return byDate(a, b);
+    });
   }
 
   private renderCurrentView(): void {
@@ -1074,76 +1433,150 @@ export class InboxView extends ItemView {
       return;
     }
 
-    // If we're drilled into a sender's messages, re-render with current sort/filters
-    if (this.activeSender) {
-      const updated = this.senderGroups.find(
-        (s) => s.groupKey === this.activeSender!.groupKey,
-      );
-      if (updated) {
-        this.activeSender = updated;
-        const displayName = this.resolveName(
-          updated.address,
-          updated.name || updated.address,
-        );
-        const msgs = this.filterSenderMessages(updated.messages);
-        void this.messageList.renderSenderMessages(displayName, msgs);
-        return;
-      }
-    }
-
     const hasMore = !!this.messageState.nextLink;
-
-    if (this.viewMode === "senders") {
-      const passesFilter = (m: Message) => {
-        const filtered = this.applyMessageFilters([m]);
-        return filtered.length > 0;
-      };
-      if (this.filterUnreadOnly) {
-        const filtered = this.senderGroups.filter((s) =>
-          s.messages.some(passesFilter),
-        );
-        void this.messageList.renderSenders(filtered, hasMore, passesFilter);
-      } else {
-        void this.messageList.renderSenders(this.senderGroups, hasMore);
-      }
-      return;
-    }
-
-    // Flat messages mode: apply filters and sort.
-    const filtered = this.applyMessageFilters(this.messageState.messages);
-    const dir = this.sortNewestFirst ? -1 : 1;
-    const sorted = [...filtered].sort(
-      (a, b) =>
-        dir *
-        (new Date(a.receivedDateTime || 0).getTime() -
-          new Date(b.receivedDateTime || 0).getTime()),
-    );
-    void this.messageList.renderFlatMessages(sorted, hasMore);
+    const sorted = this.getVisibleMessages();
+    const box = this.getSelectedBox();
+    const empty = box
+      ? { icon: box.icon || "inbox", title: `No messages in ${box.name}` }
+      : undefined;
+    void this.messageList.renderFlatMessages(sorted, hasMore, empty);
   }
 
   /**
-   * Kick off all background AI processing (tagging, prefetch, detection).
-   * Handles errors with user-facing notices instead of swallowing rejections.
+   * Gmail/Mail-style keyboard navigation. Applies only when the keyboard
+   * focus is outside text entry widgets — so shortcuts don't hijack typing
+   * in the search bar, modals, or contenteditable regions.
+   */
+  private handleKeyDown(evt: KeyboardEvent): void {
+    const t = evt.target as HTMLElement | null;
+    if (!t) return;
+    if ((evt.ctrlKey || evt.metaKey) && !evt.altKey && !evt.shiftKey && (evt.key === "a" || evt.key === "A")) {
+      evt.preventDefault();
+      const ids = this.messageList.selectAll();
+      this.handleMultiSelect(ids);
+      return;
+    }
+
+    if (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable) return;
+    if (evt.ctrlKey || evt.metaKey || evt.altKey) return;
+
+    switch (evt.key) {
+      case "j":
+      case "ArrowDown":
+        evt.preventDefault();
+        this.navigateMessage(1);
+        return;
+      case "k":
+      case "ArrowUp":
+        evt.preventDefault();
+        this.navigateMessage(-1);
+        return;
+      case "e":
+        evt.preventDefault();
+        this.toggleReadOnSelected();
+        return;
+      case "p":
+        evt.preventDefault();
+        this.togglePinOnSelected();
+        return;
+      case "#":
+      case "Delete":
+        evt.preventDefault();
+        this.deleteSelected();
+        return;
+      case "/":
+        evt.preventDefault();
+        this.searchBar.focus();
+        return;
+      case "f":
+        evt.preventDefault();
+        this.toggleCompactMode();
+        return;
+    }
+  }
+
+  /** `f` — toggle compact (single-pane) mode. The DOM class is the source of truth. */
+  private toggleCompactMode(): void {
+    this.contentEl.toggleClass(COMPACT_MODE_CLASS, !this.contentEl.hasClass(COMPACT_MODE_CLASS));
+  }
+
+  /** Move the selection up/down through the list as it's actually rendered. */
+  private navigateMessage(dir: 1 | -1): void {
+    const order = this.messageList.getRenderedOrder();
+    if (order.length === 0) return;
+    const currentIdx = this.selectedMessageId ? order.indexOf(this.selectedMessageId) : -1;
+    const nextIdx = currentIdx === -1
+      ? (dir === 1 ? 0 : order.length - 1)
+      : Math.max(0, Math.min(order.length - 1, currentIdx + dir));
+    const targetId = order[nextIdx];
+    if (!targetId || targetId === this.selectedMessageId) return;
+    const target = this.messageState.messages.find((m) => m.id === targetId);
+    if (target) void this.showMessageInViewer(target);
+  }
+
+  private toggleReadOnSelected(): void {
+    const msg = this.getSelectedMessage();
+    if (!msg) return;
+    if (msg.isRead) this.handleMarkAsUnread(msg);
+    else this.handleMarkAsRead(msg);
+  }
+
+  private deleteSelected(): void {
+    const msg = this.getSelectedMessage();
+    if (msg) this.handleDeleteMessage(msg);
+  }
+
+  private togglePinOnSelected(): void {
+    const msg = this.getSelectedMessage();
+    if (msg) this.handleTogglePin(msg);
+  }
+
+  private getSelectedMessage(): Message | null {
+    if (!this.selectedMessageId) return null;
+    return this.messageState.messages.find((m) => m.id === this.selectedMessageId) ?? null;
+  }
+
+  /**
+   * Kick off all background AI processing as a hardcoded three-stage pipeline:
+   *   1. Summarize — Claude body extraction for the prefetch window.
+   *   2. Junk tagging — classifier pass restricted to tags wired into the
+   *      Junk box, so the Junk view fills before other tags are tried.
+   *   3. Other — remaining tag classification + nickname generation.
+   * Each stage awaits the previous one so the Secretary view reflects the
+   * user-visible ordering rather than everything racing in parallel.
    */
   private startBackgroundProcessing(): void {
-    void this.generateAllNicknames();
-
     this.prefetchAllPromise = this.prefetchAllProcessed();
     this.prefetchAllPromise.catch((err) =>
       logger.warn("InboxView", "Background prefetch failed", err),
     );
 
-    // Tag after prefetch so the tagger sees processed markdown
-    // for every message within the prefetch window.
     (async () => {
-      if (this.prefetchAllPromise) {
-        try { await this.prefetchAllPromise; } catch { /* proceed anyway */ }
+      try { await this.prefetchAllPromise; } catch { /* proceed */ }
+
+      const allCandidates = this.getTagCandidates();
+      const junkTagSet = this.getJunkBoxTagSet();
+      const junkCandidates = allCandidates.filter((c) => junkTagSet.has(c.name));
+      const otherCandidates = allCandidates.filter((c) => !junkTagSet.has(c.name));
+
+      if (junkCandidates.length > 0) {
+        await this.classifier.autoTagMessages(
+          this.messageState.messages,
+          junkCandidates,
+          () => this.syncTagCacheViews(),
+        );
       }
-      await this.classifier.autoTagAllMessages(
-        this.messageState.messages,
-        () => this.syncTagCacheViews(),
-      );
-    })().catch((err) => logger.warn("InboxView", "Auto-tagging failed", err));
+
+      if (otherCandidates.length > 0) {
+        await this.classifier.autoTagMessages(
+          this.messageState.messages,
+          otherCandidates,
+          () => this.syncTagCacheViews(),
+        );
+      }
+
+      await this.generateAllNicknames();
+    })().catch((err) => logger.warn("InboxView", "Background pipeline failed", err));
 
     // When Claude processing is disabled but forwarded-sender resolution is
     // on, bodies are never prefetched by prefetchAllProcessed().  Fetch them
@@ -1152,6 +1585,12 @@ export class InboxView extends ItemView {
     if (s.resolveForwardedSender && (!s.enableClaudeProcessing || !hasClaudeAccess(s.anthropicApiKey))) {
       void this.prefetchBodiesForSenderResolution();
     }
+  }
+
+  /** Tag names wired into the Junk box's predicate (empty if none). */
+  private getJunkBoxTagSet(): Set<string> {
+    const box = (this.plugin.settings.boxes || []).find((b) => b.builtin === "junk");
+    return new Set(box?.tags || []);
   }
 
   /** Return nickname if available, otherwise normalize "Last, First" to "First Last". */
@@ -1236,6 +1675,23 @@ export class InboxView extends ItemView {
     ).open();
   }
 
+  /** Add or update a sender rule with autoBin=true (preserving any existing autoTag). */
+  private markSenderAsJunk(address: string, rawName: string): void {
+    if (!address) return;
+    const key = address.toLowerCase();
+    const rules = { ...(this.plugin.settings.senderRules || {}) };
+    const existing = rules[key] || {};
+    if (existing.autoBin) {
+      new Notice(`${this.resolveName(address, rawName)} is already marked as junk.`);
+      return;
+    }
+    rules[key] = { ...existing, autoBin: true };
+    this.plugin.settings.senderRules = rules;
+    this.plugin.scheduleSaveSettings();
+    this.applySenderRules();
+    new Notice(`${this.resolveName(address, rawName)} marked as junk sender.`);
+  }
+
   /** Apply all active sender rules to the currently-loaded messages.
    *  Runs after loadMessages and when a rule is saved. */
   private applySenderRules(): void {
@@ -1256,25 +1712,15 @@ export class InboxView extends ItemView {
         continue; // Skip tagging — message is about to be deleted.
       }
       if (rule.autoTag && msg.id) {
-        const existing = this.tagCache.get(msg.id) || [];
-        if (!existing.some((e) => e.tag === rule.autoTag)) {
+        if (!this.plugin.store.getTags(msg.id).some((e) => e.tag === rule.autoTag)) {
           toTag.push({ msgId: msg.id, tag: rule.autoTag });
         }
       }
     }
 
     for (const { msgId, tag } of toTag) {
-      const existing = this.tagCache.get(msgId) || [];
-      const entry: TagCacheEntry = {
-        messageId: msgId,
-        tag,
-        source: "manual",
-        taggedAt: Date.now(),
-      };
-      this.tagCache.set(msgId, [...existing, entry]);
       this.plugin.store.setTag(msgId, tag, "manual");
     }
-    if (toTag.length > 0) this.syncTagCacheViews();
 
     if (toBin.length > 0) {
       const victimIds = new Set(toBin.map((m) => m.id!).filter(Boolean));
@@ -1282,8 +1728,7 @@ export class InboxView extends ItemView {
         (m) => !m.id || !victimIds.has(m.id),
       );
       this.refreshListCache();
-      this.regroupAndSync();
-      this.renderCurrentView();
+      this.scheduleRender({ tags: toTag.length > 0, regroup: true, list: true });
 
       const api = this.plugin.mailApi;
       for (const msg of toBin) {
@@ -1294,7 +1739,7 @@ export class InboxView extends ItemView {
         });
       }
     } else if (toTag.length > 0) {
-      this.renderCurrentView();
+      this.scheduleRender({ tags: true, list: true });
     }
   }
 
@@ -1307,39 +1752,8 @@ export class InboxView extends ItemView {
    * originalSender extracted from the forwarded body, that original sender
    * is returned instead, with the envelope sender demoted to `via*` fields.
    */
-  private getEffectiveSender(msg: Message): {
-    address: string;
-    name: string;
-    viaAddress?: string;
-    viaName?: string;
-  } {
-    const envelope = getEnvelopeSender(msg);
-
-    if (!this.plugin.settings.resolveForwardedSender) {
-      return { address: envelope.address, name: envelope.name };
-    }
-
-    const cached = this.plugin.store.getBody(msg.id || "");
-    if (cached) {
-      let original = cached.originalSender;
-      // Backfill: extract from bodies cached before this feature existed
-      if (!original && /^(?:fw|fwd)\s*:/i.test(cached.subject) && cached.bodyHtml) {
-        original = extractForwardedSender(cached.bodyHtml) ?? undefined;
-        if (original) {
-          cached.originalSender = original;
-        }
-      }
-      if (original?.address) {
-        return {
-          address: original.address,
-          name: original.name || original.address,
-          viaAddress: envelope.address,
-          viaName: envelope.name,
-        };
-      }
-    }
-
-    return { address: envelope.address, name: envelope.name };
+  private getEffectiveSender(msg: Message) {
+    return getEffectiveSender(this.plugin, msg);
   }
 
   /** Generate nicknames for all unique senders that don't have one yet. */
@@ -1407,352 +1821,22 @@ export class InboxView extends ItemView {
     await Promise.all(workers);
 
     // Re-render to show nicknames
-    this.regroupAndSync();
-    this.renderCurrentView();
+    this.scheduleRender({ regroup: true, list: true });
   }
 
-  private handleSenderSelect(sender: SenderGroup): void {
-    this.activeSender = sender;
-    this.messageViewer.clear();
-    const displayName = this.resolveName(
-      sender.address,
-      sender.name || sender.address,
-    );
-    const msgs = this.filterSenderMessages(sender.messages);
-    void this.messageList.renderSenderMessages(displayName, msgs);
-
-    // Auto-select the message at the top of the rendered list.
-    if (msgs.length > 0) {
-      void this.showMessageInViewer(msgs[0]);
-    }
-  }
-
-  /** Apply active toggle filters (unread, tags) to a message list. */
+  /** Apply the selected box's predicate to a message list. */
   private applyMessageFilters(messages: Message[]): Message[] {
-    let filtered = messages;
-    if (this.filterUnreadOnly) {
-      filtered = filtered.filter((m) => !m.isRead);
-    }
-    if (this.filterTags.size > 0) {
-      filtered = filtered.filter((m) => {
-        if (!m.id) return false;
-        const entries = this.tagCache.get(m.id);
-        if (!entries || entries.length === 0) return false;
-        const msgTags = new Set(entries.map((e) => e.tag));
-        for (const t of this.filterTags) {
-          if (!msgTags.has(t)) return false;
-        }
-        return true;
-      });
-    }
-    return filtered;
+    const box = this.getSelectedBox();
+    if (!box) return messages;
+    const inFlight = this.classifier.getInFlightIds();
+    return messages.filter((m) => this.messageMatchesBox(m, box, inFlight));
   }
 
-  /** Toggle a tag in the active filter set and re-render. */
-  private toggleTagFilter(tag: string): void {
-    if (this.filterTags.has(tag)) {
-      this.filterTags.delete(tag);
-    } else {
-      this.filterTags.add(tag);
-    }
-    // Drop filter entries that no longer correspond to defined categories.
-    const defined = new Set(this.getTagCategories());
-    for (const t of Array.from(this.filterTags)) {
-      if (!defined.has(t)) this.filterTags.delete(t);
-    }
-    this.rebuildTagWrap();
-    this.applyFilters();
-  }
-
-  /** Apply active filters to a sender's message list. */
-  private filterSenderMessages(messages: Message[]): Message[] {
-    const filtered = this.applyMessageFilters(messages);
-    const dir = this.sortNewestFirst ? -1 : 1;
-    filtered.sort(
-      (a, b) =>
-        dir *
-        (new Date(a.receivedDateTime || 0).getTime() -
-          new Date(b.receivedDateTime || 0).getTime()),
-    );
-    return filtered;
-  }
-
-  // --- Private: tag classification ---
-
-  private rebuildTagWrap(): void {
-    this.tagWrap.empty();
-
-    const categories = this.getTagCategories();
-    const icons = this.plugin.settings.tagIcons || {};
-
-    // Drop filter entries for tags that no longer exist.
-    const defined = new Set(categories);
-    for (const t of Array.from(this.filterTags)) {
-      if (!defined.has(t)) this.filterTags.delete(t);
-    }
-
-    // Lead icon (always visible)
-    const leadBtn = this.tagWrap.createEl("button", {
-      cls: "iris-topbar-btn clickable-icon",
-      attr: { "aria-label": "Tags" },
-    });
-    setIcon(leadBtn, "tag");
-    leadBtn.addEventListener("contextmenu", (e) => {
-      e.preventDefault();
-      this.openHiddenTagsMenu(e);
-    });
-
-    const colors = this.plugin.settings.tagColors || {};
-
-    // One button per existing tag (hidden, revealed on hover)
-    for (const cat of categories) {
-      const wrap = this.tagWrap.createDiv({ cls: "iris-tag-icon-wrap" });
-      const isActive = this.filterTags.has(cat);
-      const btn = wrap.createEl("button", {
-        cls: "iris-filter-opt clickable-icon" + (isActive ? " is-active" : ""),
-        attr: { "aria-label": `Filter: ${cat}` },
-      });
-      if (colors[cat]) btn.style.color = colors[cat];
-      setIcon(btn, icons[cat] || "tag");
-      wrap.createSpan({ cls: "iris-tag-icon-label", text: cat });
-      btn.addEventListener("click", () => this.toggleTagFilter(cat));
-      btn.addEventListener("contextmenu", (e) => {
-        e.preventDefault();
-        this.openTagContextMenu(e, cat);
-      });
-    }
-
-    // Plus button (also hidden, revealed on hover)
-    const addBtn = this.tagWrap.createEl("button", {
-      cls: "iris-filter-opt clickable-icon",
-      attr: { "aria-label": "Add tag" },
-    });
-    setIcon(addBtn, "plus");
-    addBtn.addEventListener("click", () =>
-      this.showAddTagInput(this.tagWrap),
-    );
-  }
-
-  private showAddTagInput(_anchor: HTMLElement): void {
-    const s = this.plugin.settings;
-    const categories = this.getTagCategories();
-    const canGenerate = s.enableClaudeProcessing && hasClaudeAccess(s.anthropicApiKey);
-
-    new CreateTagModal(this.plugin.app, {
-      existingTags: categories,
-      onGenerate: canGenerate
-        ? (name) => generateTagDescription(
-            s.anthropicApiKey,
-            s.claudeModel,
-            name,
-            this.getTagCandidates(),
-          )
-        : undefined,
-      onSubmit: async (name, criteria, icon, iconExplicit, color, contradicts, precludes, precludedBy) => {
-        const updated = [...categories, name];
-        this.plugin.settings.tagCategories = updated.join(", ");
-        if (!this.plugin.settings.tagIcons) this.plugin.settings.tagIcons = {};
-        if (!this.plugin.settings.tagDescriptions) this.plugin.settings.tagDescriptions = {};
-        if (!this.plugin.settings.tagColors) this.plugin.settings.tagColors = {};
-        if (!this.plugin.settings.tagContradictions) this.plugin.settings.tagContradictions = {};
-        if (!this.plugin.settings.tagPrecludes) this.plugin.settings.tagPrecludes = {};
-        this.plugin.settings.tagDescriptions[name] = criteria;
-
-        const usedIcons = Object.values(this.plugin.settings.tagIcons);
-        this.plugin.settings.tagIcons[name] = icon;
-        if (color) {
-          this.plugin.settings.tagColors[name] = color;
-        } else {
-          delete this.plugin.settings.tagColors[name];
-        }
-        setTagContradictions(this.plugin.settings.tagContradictions, name, contradicts);
-        setTagPrecludesList(this.plugin.settings.tagPrecludes, name, precludes);
-        setPrecludedByFor(this.plugin.settings.tagPrecludes, name, precludedBy);
-        void this.plugin.saveSettings();
-        this.messageViewer.setTagCategories(updated);
-        this.syncTagMetadataViews();
-        this.rebuildTagWrap();
-
-        if (!iconExplicit && canGenerate) {
-          try {
-            const picked = await pickTagIcon(
-              s.anthropicApiKey, s.claudeModel, name, criteria,
-              TAG_ICON_POOL, usedIcons,
-            );
-            if (picked) {
-              this.plugin.settings.tagIcons[name] = picked;
-              void this.plugin.saveSettings();
-              this.syncTagMetadataViews();
-              this.rebuildTagWrap();
-            }
-          } catch (err) {
-            logger.warn("InboxView", "AI icon pick failed; kept fallback", err);
-          }
-        }
-      },
-    }).open();
-  }
-
-  private openHiddenTagsMenu(evt: MouseEvent): void {
-    const s = this.plugin.settings;
-    const hiddenMap = s.tagHiddenInList || {};
-    const hidden = this.getTagCategories().filter((c) => hiddenMap[c]);
-    const menu = new Menu();
-    if (hidden.length === 0) {
-      menu.addItem((item) => item.setTitle("No tags hidden from message lists").setDisabled(true));
-    } else {
-      for (const cat of hidden) {
-        menu.addItem((item) =>
-          item
-            .setTitle(`Show "${cat}" in message lists`)
-            .setIcon("eye")
-            .onClick(() => this.toggleTagListHidden(cat)),
-        );
-      }
-    }
-    menu.showAtMouseEvent(evt);
-  }
-
-  private openTagContextMenu(evt: MouseEvent, cat: string): void {
-    const s = this.plugin.settings;
-    const isHidden = !!s.tagHiddenInList?.[cat];
-
-    const menu = new Menu();
-
-    menu.addItem((item) =>
-      item
-        .setTitle(isHidden ? "Show in message lists" : "Hide from message lists")
-        .setIcon(isHidden ? "eye" : "eye-off")
-        .onClick(() => this.toggleTagListHidden(cat)),
-    );
-
-    menu.addSeparator();
-    menu.addItem((item) =>
-      item
-        .setTitle("Edit tag…")
-        .setIcon("pencil")
-        .onClick(() => this.openTagEditModal(cat)),
-    );
-    menu.addItem((item) =>
-      item
-        .setTitle("Delete tag")
-        .setIcon("trash-2")
-        .setWarning(true)
-        .onClick(() => this.deleteTag(cat)),
-    );
-
-    menu.showAtMouseEvent(evt);
-  }
-
-  /** Delete a tag entirely: purge settings, message entries, and refresh UI. */
-  private deleteTag(cat: string): void {
-    const affected = Array.from(this.tagCache.entries()).filter(
-      ([, entries]) => entries.some((e) => e.tag === cat),
-    );
-
-    const s = this.plugin.settings;
-
-    // Settings scalar/maps
-    const remaining = parseTagCategories(s.tagCategories).filter((n) => n !== cat);
-    s.tagCategories = remaining.join(", ");
-    if (s.tagIcons) delete s.tagIcons[cat];
-    if (s.tagDescriptions) delete s.tagDescriptions[cat];
-    if (s.tagColors) delete s.tagColors[cat];
-    if (s.tagPromptVersions) delete s.tagPromptVersions[cat];
-    if (s.tagHiddenInList) delete s.tagHiddenInList[cat];
-    if (s.tagContradictions) removeTagFromContradictions(s.tagContradictions, cat);
-    if (s.tagPrecludes) removeTagFromPrecludes(s.tagPrecludes, cat);
-
-    // In-memory and persistent per-message tag entries
-    for (const [msgId, entries] of affected) {
-      const filtered = entries.filter((e) => e.tag !== cat);
-      if (filtered.length === 0) {
-        this.tagCache.delete(msgId);
-      } else {
-        this.tagCache.set(msgId, filtered);
-      }
-      this.plugin.store.removeTag(msgId, cat);
-    }
-
-    // Active filters referencing the deleted tag
-    this.filterTags.delete(cat);
-
-    void this.plugin.saveSettings();
-    this.syncTagMetadataViews();
-    this.messageList.setHiddenListTags(this.getHiddenListTagSet());
-    this.messageViewer.setTagCategories(remaining);
-    this.syncTagCacheViews();
-    this.rebuildTagWrap();
-    this.applyFilters();
-    this.messageViewer.refresh();
-    new Notice(`Deleted tag "${cat}".`);
-  }
-
-  private toggleTagListHidden(cat: string): void {
-    const s = this.plugin.settings;
-    if (!s.tagHiddenInList) s.tagHiddenInList = {};
-    if (s.tagHiddenInList[cat]) {
-      delete s.tagHiddenInList[cat];
-    } else {
-      s.tagHiddenInList[cat] = true;
-    }
-    void this.plugin.saveSettings();
-    this.messageList.setHiddenListTags(this.getHiddenListTagSet());
-    this.messageList.refreshTagBadges();
-  }
+  // --- Private: tag management ---
 
   private getHiddenListTagSet(): Set<string> {
     const map = this.plugin.settings.tagHiddenInList || {};
     return new Set(Object.keys(map).filter((k) => map[k]));
-  }
-
-  private openTagEditModal(cat: string): void {
-    const s = this.plugin.settings;
-    const canGenerate = s.enableClaudeProcessing && hasClaudeAccess(s.anthropicApiKey);
-    new CreateTagModal(this.plugin.app, {
-      existingTags: this.getTagCategories(),
-      initial: {
-        name: cat,
-        criteria: s.tagDescriptions?.[cat] || "",
-        icon: s.tagIcons?.[cat] || "tag",
-        color: s.tagColors?.[cat] || "",
-        contradicts: s.tagContradictions?.[cat] || [],
-        precludes: s.tagPrecludes?.[cat] || [],
-        precludedBy: getPrecludedBy(s.tagPrecludes || {}, cat),
-      },
-      onGenerate: canGenerate
-        ? (name) => generateTagDescription(
-            s.anthropicApiKey, s.claudeModel, name,
-            this.getTagCandidates().filter((t) => t.name !== cat),
-          )
-        : undefined,
-      onSubmit: (_name, criteria, icon, _iconExplicit, color, contradicts, precludes, precludedBy) => {
-        const criteriaChanged = (s.tagDescriptions?.[cat] || "") !== criteria;
-        if (!s.tagDescriptions) s.tagDescriptions = {};
-        if (!s.tagIcons) s.tagIcons = {};
-        if (!s.tagColors) s.tagColors = {};
-        if (!s.tagContradictions) s.tagContradictions = {};
-        if (!s.tagPrecludes) s.tagPrecludes = {};
-        s.tagDescriptions[cat] = criteria;
-        s.tagIcons[cat] = icon;
-        if (color) {
-          s.tagColors[cat] = color;
-        } else {
-          delete s.tagColors[cat];
-        }
-        setTagContradictions(s.tagContradictions, cat, contradicts);
-        setTagPrecludesList(s.tagPrecludes, cat, precludes);
-        setPrecludedByFor(s.tagPrecludes, cat, precludedBy);
-        if (criteriaChanged) {
-          if (!s.tagPromptVersions) s.tagPromptVersions = {};
-          bumpTagVersion(s.tagPromptVersions, cat);
-        }
-        void this.plugin.saveSettings();
-        this.syncTagMetadataViews();
-        this.rebuildTagWrap();
-        this.messageViewer.refresh();
-      },
-    }).open();
   }
 
   private getTagCategories(): string[] {
@@ -1777,6 +1861,11 @@ export class InboxView extends ItemView {
     return new Map(Object.entries(colors));
   }
 
+  private getTagDescriptionMap(): Map<string, string> {
+    const descriptions = this.plugin.settings.tagDescriptions || {};
+    return new Map(Object.entries(descriptions).filter(([, v]) => !!v && v.trim().length > 0));
+  }
+
   private getClassifiableContent(msg: Message): string {
     if (!msg.id) return [msg.subject, msg.bodyPreview].filter(Boolean).join("\n");
     const processed = this.plugin.store.getProcessed(msg.id);
@@ -1797,7 +1886,7 @@ export class InboxView extends ItemView {
   private handleTagChange(msg: Message, tag: string | null): void {
     if (!msg.id) return;
 
-    const existing = this.tagCache.get(msg.id) || [];
+    const existing = this.plugin.store.getTags(msg.id);
     const removedAutoTags: string[] = [];
 
     if (tag === null) {
@@ -1805,28 +1894,14 @@ export class InboxView extends ItemView {
       for (const e of existing) {
         if (e.source === "auto") removedAutoTags.push(e.tag);
       }
-      this.tagCache.delete(msg.id);
       this.plugin.store.removeTag(msg.id);
     } else {
       // Toggle: if tag already present, remove it; otherwise add it
       const has = existing.find((e) => e.tag === tag);
       if (has) {
         if (has.source === "auto") removedAutoTags.push(tag);
-        const updated = existing.filter((e) => e.tag !== tag);
-        if (updated.length === 0) {
-          this.tagCache.delete(msg.id);
-        } else {
-          this.tagCache.set(msg.id, updated);
-        }
         this.plugin.store.removeTag(msg.id, tag);
       } else {
-        const entry: TagCacheEntry = {
-          messageId: msg.id,
-          tag,
-          source: "manual",
-          taggedAt: Date.now(),
-        };
-        this.tagCache.set(msg.id, [...existing, entry]);
         this.plugin.store.setTag(msg.id, tag, "manual");
       }
     }
@@ -1975,7 +2050,7 @@ export class InboxView extends ItemView {
       const parsedContent = this.buildEmailContext(msg) + parsedBody;
 
       // Full extraction
-      this.prefetchInflight.add(msgId);
+      this.markSummarizing(msgId, true);
       try {
         const markdown = await processEmailWithClaude(
           s.anthropicApiKey,
@@ -1995,7 +2070,7 @@ export class InboxView extends ItemView {
       } catch (err) {
         logger.warn("InboxView", `Prefetch Claude processing failed for ${msgId}`, err);
       } finally {
-        this.prefetchInflight.delete(msgId);
+        this.markSummarizing(msgId, false);
       }
     }
   }
@@ -2036,186 +2111,23 @@ export class InboxView extends ItemView {
 
     if (fetched && this.prefetchGeneration === gen) {
       this.regroupAndSync();
+      // Republish so widgets re-render with the now-resolved original senders.
+      this.plugin.setInboxMessages(this.messageState.messages);
     }
   }
 
-  // ── User-initiated event/task detection ─────────────────────
-
-  /** Run item detection for a single message, triggered by the user via
-   *  the reload button in the message viewer. */
-  private async detectItemsOnDemand(msg: Message): Promise<void> {
-    const s = this.plugin.settings;
-    if (!s.enableClaudeProcessing || !hasClaudeAccess(s.anthropicApiKey)) return;
-
-    const msgId = msg.id;
-    if (!msgId) return;
-
-    const cache = this.plugin.store;
-
-    // Only use Claude-processed markdown — skip if not yet available
-    const processed = cache.getProcessed(msgId);
-    if (!processed) return;
-    const content = processed.processedMarkdown;
-    if (!content) return;
-
-    const effectivePrompt = s.itemDetectionPrompt || ITEM_DETECTION_PROMPT;
-    const emailContext = {
-      subject: msg.subject || "",
-      from: msg.from?.emailAddress?.name || msg.from?.emailAddress?.address || "",
-      date: msg.receivedDateTime || "",
-      userName: this.getMessageOwnerName(msg),
-    };
-
-    try {
-      const detected = await detectItemsInEmail(
-        s.anthropicApiKey, s.claudeModel, effectivePrompt, content, emailContext,
-      );
-
-      logger.debug("InboxView", `Detection returned ${detected.length} items for ${msgId}`);
-      cache.setItemsScanned(msgId);
-
-      this.storeDetectedItems(msgId, detected);
-    } catch (err) {
-      logger.warn("InboxView", `On-demand item detection failed for ${msgId}`, err);
-    }
-  }
-
-
-  /** Convert DetectedItem[] to DetectedItemEntry[], persist, update caches, and refresh viewer. */
-  private storeDetectedItems(msgId: string, detected: import("../utils/claudeApi").DetectedItem[]): void {
-    const cache = this.plugin.store;
-    if (detected.length > 0) {
-      const now = Date.now();
-      const entries: DetectedItemEntry[] = detected.map((d, i) => ({
-        itemId: `${msgId}-${i}`,
-        messageId: msgId,
-        type: d.type,
-        title: d.title,
-        date: d.date,
-        time: d.time,
-        location: d.location,
-        dueDate: d.dueDate,
-        priority: d.priority,
-        description: d.description,
-        sourceText: d.sourceText,
-        status: "pending" as const,
-        detectedAt: now,
-      }));
-      cache.setDetectedItems(msgId, entries);
-      this.detectedItemsCache.set(msgId, entries);
-
-      if (msgId === this.selectedMessageId) {
-        this.messageViewer.setDetectedItems(entries);
-        this.messageViewer.refresh();
-      }
-    } else {
-      cache.setDetectedItems(msgId, []);
-    }
-  }
-
-  private async handleAcceptDetectedItem(messageId: string, item: DetectedItemEntry): Promise<void> {
-    const s = this.plugin.settings;
-    const msg = this.messageState.messages.find((m) => m.id === messageId);
-
-    // Build an ExtractedNote from the detected item
-    let note: ExtractedNote;
-    if (item.type === "event") {
-      note = {
-        type: "event",
-        title: item.title,
-        date: item.date || "",
-        time: item.time || "",
-        location: item.location || "",
-        description: item.description,
-      };
-    } else {
-      note = {
-        type: "task",
-        title: item.title,
-        dueDate: item.dueDate || "",
-        description: item.description,
-      };
-    }
-
-    try {
-      const filePath = await this.saveExtractedNote(note, msg || { id: messageId } as Message);
-      this.plugin.store.updateDetectedItemStatus(messageId, item.itemId, "accepted", filePath);
-
-      // Update L1 cache
-      const items = this.detectedItemsCache.get(messageId);
-      if (items) {
-        const entry = items.find((i) => i.itemId === item.itemId);
-        if (entry) {
-          entry.status = "accepted";
-          entry.vaultPath = filePath;
-          entry.resolvedAt = Date.now();
-        }
-      }
-
-      // Refresh viewer if showing this message
-      if (messageId === this.selectedMessageId) {
-        this.messageViewer.setDetectedItems(items || []);
-        this.messageViewer.refresh();
-      }
-      new Notice(`${item.type === "event" ? "Event" : "Task"} note created: ${filePath}`);
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      new Notice(`Failed to create note: ${errMsg}`);
-    }
-  }
-
-  private handleDismissDetectedItem(messageId: string, itemId: string): void {
-    this.plugin.store.updateDetectedItemStatus(messageId, itemId, "dismissed");
-
-    const items = this.detectedItemsCache.get(messageId);
-    if (items) {
-      const entry = items.find((i) => i.itemId === itemId);
-      if (entry) {
-        entry.status = "dismissed";
-        entry.resolvedAt = Date.now();
-      }
-    }
-
-    if (messageId === this.selectedMessageId) {
-      this.messageViewer.setDetectedItems(items || []);
-      this.messageViewer.refresh();
-    }
-  }
-
-  private handleUpdateDetectedItem(messageId: string, itemId: string, updates: Partial<DetectedItemEntry>): void {
-    const items = this.detectedItemsCache.get(messageId);
-    if (!items) return;
-    const entry = items.find((i) => i.itemId === itemId);
-    if (!entry) return;
-
-    Object.assign(entry, updates);
-    this.plugin.store.setDetectedItems(messageId, items);
-
-    if (messageId === this.selectedMessageId) {
-      this.messageViewer.setDetectedItems(items);
-      this.messageViewer.refresh();
-    }
-  }
-
-  private async handleReloadDetectedItems(messageId: string): Promise<void> {
-    // Clear existing scan so on-demand detection re-runs
-    this.plugin.store.clearItemsScan(messageId);
-    this.detectedItemsCache.delete(messageId);
-
-    // Re-run detection
-    const msg = this.messageState.messages.find((m) => m.id === messageId);
-    if (!msg) return;
-
-    const cache = this.plugin.store;
-    const body = cache.getBody(messageId);
-    const stripped = body ? body.strippedHtml : "";
-
-    if (messageId === this.selectedMessageId) {
-      this.messageViewer.setDetectedItems([]);
-      this.messageViewer.refresh();
-    }
-
-    await this.detectItemsOnDemand(msg);
+  /** Re-push tag icons/colors/categories and refresh the list after the tags
+   *  modal mutates settings. */
+  private handleTagsSettingsChanged(): void {
+    this.messageViewer.setTagCategories(this.getTagCategories());
+    this.messageViewer.setTagIcons(this.getTagIconMap());
+    this.messageViewer.setTagColors(this.getTagColorMap());
+    this.messageViewer.setTagDescriptions(this.getTagDescriptionMap());
+    this.messageList.setTagIcons(this.getTagIconMap());
+    this.messageList.setTagColors(this.getTagColorMap());
+    this.messageList.setTagDescriptions(this.getTagDescriptionMap());
+    this.messageList.setHiddenListTags(this.getHiddenListTagSet());
+    this.scheduleRender({ tags: true, regroup: true, list: true });
   }
 
   /** Push current prompt versions to MessageViewer and re-render the selected message. */
@@ -2242,8 +2154,7 @@ export class InboxView extends ItemView {
     if (!content) return;
 
     // Remove old auto-tags, keep manual
-    const existing = this.tagCache.get(msg.id) || [];
-    const manual = existing.filter((e) => e.source === "manual");
+    const existing = this.plugin.store.getTags(msg.id);
     for (const e of existing) {
       if (e.source === "auto") this.plugin.store.removeTag(msg.id, e.tag);
     }
@@ -2259,29 +2170,10 @@ export class InboxView extends ItemView {
         s.tagPrecludes || {},
       );
 
-      const newEntries: TagCacheEntry[] = tags.map((tag) => ({
-        messageId: msg.id!,
-        tag,
-        source: "auto" as const,
-        promptVersion: getTagVersion(s.tagPromptVersions, tag),
-        taggedAt: Date.now(),
-      }));
-      const merged = [...manual, ...newEntries];
-      if (merged.length > 0) {
-        this.tagCache.set(msg.id, merged);
-      } else {
-        this.tagCache.delete(msg.id);
-      }
       for (const tag of tags) {
         this.plugin.store.setTag(msg.id, tag, "auto", getTagVersion(s.tagPromptVersions, tag));
       }
     } catch (err) {
-      // On failure, keep manual tags only
-      if (manual.length > 0) {
-        this.tagCache.set(msg.id, manual);
-      } else {
-        this.tagCache.delete(msg.id);
-      }
       logger.warn("InboxView", "Re-tag failed", err);
     }
 
@@ -2302,75 +2194,16 @@ export class InboxView extends ItemView {
 
   // --- Private: helpers ---
 
-  private groupByEffectiveSender(messages: Message[]): SenderGroup[] {
-    interface GroupInfo { address: string; name: string; messages: Message[] }
-    const groups = new Map<string, GroupInfo>();
-
-    for (const msg of messages) {
-      const eff = this.getEffectiveSender(msg);
-      const addr = (eff.address || "unknown").toLowerCase();
-      const name = eff.name || addr;
-      // When different people send via the same institutional address,
-      // include the sender name in the key to keep them separate.
-      const groupKey = eff.viaName
-        ? `${addr}::${name.toLowerCase()}`
-        : addr;
-      const existing = groups.get(groupKey);
-      if (existing) {
-        existing.messages.push(msg);
-      } else {
-        groups.set(groupKey, { address: addr, name, messages: [msg] });
-      }
-    }
-
-    const senders: SenderGroup[] = [];
-    for (const [groupKey, group] of groups) {
-      group.messages.sort(
-        (a, b) =>
-          new Date(a.receivedDateTime || 0).getTime() -
-          new Date(b.receivedDateTime || 0).getTime(),
-      );
-
-      const latestMessage = group.messages[group.messages.length - 1];
-
-      senders.push({
-        groupKey,
-        address: group.address,
-        name: group.name,
-        messages: group.messages,
-        latestMessage,
-        unreadCount: group.messages.filter((m) => !m.isRead).length,
-      });
-    }
-
-    const dir = this.sortNewestFirst ? -1 : 1;
-    senders.sort(
-      (a, b) =>
-        dir * (new Date(a.latestMessage.receivedDateTime || 0).getTime() -
-        new Date(b.latestMessage.receivedDateTime || 0).getTime()),
-    );
-
-    return senders;
-  }
-
   syncBadge(): void {
-    const mode = this.plugin.settings.badgeCount;
-    if (mode === "off") {
+    if (!this.plugin.settings.badgeCount) {
       this.plugin.updateBadge(0);
       return;
     }
-
-    // Apply the same filters the view uses so the badge matches what's shown
-    const msgs = this.applyMessageFilters(this.messageState.messages);
-
-    switch (mode) {
-      case "unread":
-        this.plugin.updateBadge(msgs.filter((m) => !m.isRead).length);
-        break;
-      case "total":
-        this.plugin.updateBadge(msgs.length);
-        break;
+    let inboxCount = 0;
+    for (const m of this.messageState.messages) {
+      if (!m.isRead) inboxCount++;
     }
+    this.plugin.updateBadge(inboxCount);
   }
 
   /** Build an email context header (subject, sender, date) to prepend to body

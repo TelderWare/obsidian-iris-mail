@@ -1,13 +1,17 @@
 import { App, MarkdownRenderer, Menu, sanitizeHTMLToDom, setIcon } from "obsidian";
 import type { Message } from "../../types";
-import type { TagCacheEntry, DetectedItemEntry } from "../../store/types";
+import type { TagCacheEntry } from "../../store/types";
 import type { NameResolver, EffectiveSenderResolver } from "./MessageList";
 import type { NoteType } from "../../utils/claudeApi";
-import { formatRelativeDate, formatItemDate } from "../../utils/dateFormat";
+import { formatRelativeDate } from "../../utils/dateFormat";
 
 interface MessageViewerCallbacks {
   onMarkAsRead: (msg: Message) => void;
   onMarkAsUnread: (msg: Message) => void;
+  /** Toggle the message's client-side to-do flag (moves it to/from the To-do box). */
+  onToggleTodo: (msg: Message) => void;
+  /** Toggle the message's pin state. Pinned messages are always loaded. */
+  onTogglePin: (msg: Message) => void;
   onTagChange: (msg: Message, tag: string | null) => void;
   /** Re-tag a message with the current prompt (replaces obsolete auto-tags). */
   onRetagMessage: (msg: Message) => void;
@@ -25,18 +29,12 @@ interface MessageViewerCallbacks {
   onBulkDenyTag: (ids: Set<string>, tag: string) => void;
   /** Create an Event or Task note from selected text in the email body. */
   onCreateNoteFromSelection: (selectedText: string, noteType: NoteType, msg: Message) => void;
-  /** Accept a detected item — creates the note. */
-  onAcceptDetectedItem: (messageId: string, item: DetectedItemEntry) => void;
-  /** Dismiss a detected item. */
-  onDismissDetectedItem: (messageId: string, itemId: string) => void;
-  /** Update detected item fields before accepting. */
-  onUpdateDetectedItem: (messageId: string, itemId: string, updates: Partial<DetectedItemEntry>) => void;
-  /** Re-run item detection for the current message. */
-  onReloadDetectedItems: (messageId: string) => void;
   /** Re-process the current message with the current prompt (replaces stale cached result). */
   onReprocessMessage: (msg: Message) => void;
   /** Open the nickname editor for an address. */
   onEditNickname: (address: string, rawName: string) => void;
+  /** Add a sender rule that auto-bins all future messages from this address. */
+  onMarkSenderAsJunk: (address: string, rawName: string) => void;
   /** Dismiss the viewer (used by compact back button). */
   onDismiss?: () => void;
 }
@@ -55,11 +53,12 @@ export class MessageViewer {
   private tagCategories: string[] = [];
   private tagIcons = new Map<string, string>();
   private tagColors = new Map<string, string>();
+  private tagDescriptions = new Map<string, string>();
   private tagCache = new Map<string, TagCacheEntry[]>();
+  private todoIds = new Set<string>();
+  private junkIds = new Set<string>();
+  private pinnedIds = new Set<string>();
   private resolveEffectiveSender: EffectiveSenderResolver | null = null;
-  private detectedItems: DetectedItemEntry[] = [];
-  private showAllDetectedItems = false;
-  private editingItemId: string | null = null;
   private processedIsStale = false;
 
   constructor(
@@ -91,12 +90,27 @@ export class MessageViewer {
     this.tagColors = colors;
   }
 
+  setTagDescriptions(descriptions: Map<string, string>): void {
+    this.tagDescriptions = descriptions;
+  }
+
   setTagCache(cache: Map<string, TagCacheEntry[]>): void {
     this.tagCache = cache;
   }
 
-  setDetectedItems(items: DetectedItemEntry[]): void {
-    this.detectedItems = items;
+  setTodoIds(ids: Set<string>): void {
+    this.todoIds = ids;
+    if (this.currentMsg) this.rebuildView();
+  }
+
+  setJunkIds(ids: Set<string>): void {
+    this.junkIds = ids;
+    if (this.currentMsg) this.rebuildView();
+  }
+
+  setPinnedIds(ids: Set<string>): void {
+    this.pinnedIds = ids;
+    if (this.currentMsg) this.rebuildView();
   }
 
   setPromptVersions(tagVersions: Record<string, number>): void {
@@ -308,12 +322,14 @@ export class MessageViewer {
           const isAutoTag = entry.source === "auto";
           const isObsoleteTag = isAutoTag && entry.promptVersion != null
             && entry.promptVersion < tagVer(entry.tag);
+          const desc = this.tagDescriptions.get(entry.tag);
+          const status = isObsoleteTag
+            ? `Auto-tagged v${entry.promptVersion} (obsolete) — right-click to remove`
+            : (isAutoTag ? "Auto-tagged" : "Manually tagged") + " — right-click to remove";
           const tagBadge = tagsLine.createSpan({
             cls: `iris-viewer-tag${isAutoTag ? " is-auto" : ""}${isObsoleteTag ? " is-obsolete" : ""}`,
             attr: {
-              title: isObsoleteTag
-                ? `Auto-tagged v${entry.promptVersion} (obsolete) — right-click to remove`
-                : (isAutoTag ? "Auto-tagged" : "Manually tagged") + " — right-click to remove",
+              title: desc ? `${entry.tag} — ${desc}\n\n${status}` : status,
             },
           });
           const tagColor = this.tagColors.get(entry.tag);
@@ -414,7 +430,7 @@ export class MessageViewer {
     if (!msg.isRead) {
       const markReadBtn = actionsEl.createEl("button", {
         cls: "iris-header-icon clickable-icon",
-        attr: { "aria-label": "Mark as read" },
+        attr: { "aria-label": "Mark as read (e)" },
       });
       setIcon(markReadBtn, "mail-open");
       markReadBtn.addEventListener("click", () => {
@@ -423,7 +439,7 @@ export class MessageViewer {
     } else {
       const markUnreadBtn = actionsEl.createEl("button", {
         cls: "iris-header-icon clickable-icon",
-        attr: { "aria-label": "Mark as unread" },
+        attr: { "aria-label": "Mark as unread (e)" },
       });
       setIcon(markUnreadBtn, "mail");
       markUnreadBtn.addEventListener("click", () => {
@@ -431,9 +447,30 @@ export class MessageViewer {
       });
     }
 
+    const id = msg.id || "";
+    const isTodo = id ? this.todoIds.has(id) : false;
+    const todoBtn = actionsEl.createEl("button", {
+      cls: "iris-header-icon clickable-icon" + (isTodo ? " is-active" : ""),
+      attr: { "aria-label": isTodo ? "Unmark to-do" : "Mark as to-do" },
+    });
+    setIcon(todoBtn, "check-square");
+    todoBtn.addEventListener("click", () => {
+      this.callbacks.onToggleTodo(msg);
+    });
+
+    const isPinned = id ? this.pinnedIds.has(id) : false;
+    const pinBtn = actionsEl.createEl("button", {
+      cls: "iris-header-icon clickable-icon" + (isPinned ? " is-active" : ""),
+      attr: { "aria-label": isPinned ? "Unpin (p)" : "Pin — always load (p)" },
+    });
+    setIcon(pinBtn, isPinned ? "pin-off" : "pin");
+    pinBtn.addEventListener("click", () => {
+      this.callbacks.onTogglePin(msg);
+    });
+
     const deleteBtn = actionsEl.createEl("button", {
       cls: "iris-header-icon clickable-icon",
-      attr: { "aria-label": "Move to bin" },
+      attr: { "aria-label": "Move to bin (#)" },
     });
     setIcon(deleteBtn, "trash-2");
     deleteBtn.addEventListener("click", () => {
@@ -520,25 +557,6 @@ export class MessageViewer {
         menu.showAtMouseEvent(evt);
       });
 
-      // Bottom area: reload button + detected items panel
-      if (msg.id) {
-        const bottomEl = this.containerEl.createDiv({ cls: "iris-detected-items-bottom" });
-
-        const reloadRow = bottomEl.createDiv({ cls: "iris-detected-items-reload-row" });
-        const reloadBtn = reloadRow.createEl("button", {
-          cls: "iris-detected-item-btn iris-detected-items-reload clickable-icon",
-          attr: { "aria-label": "Detect events & tasks" },
-        });
-        setIcon(reloadBtn, "refresh-cw");
-        reloadBtn.addEventListener("click", (e) => {
-          e.stopPropagation();
-          this.callbacks.onReloadDetectedItems(msg.id!);
-        });
-
-        if (this.detectedItems.length > 0) {
-          this.renderDetectedItemsPanel(bottomEl, msg);
-        }
-      }
     };
 
     if (this.showingProcessed && this.processedMarkdown) {
@@ -554,211 +572,6 @@ export class MessageViewer {
       this.renderHtmlBody(bodyEl, this.currentHtml);
       finishBody();
     }
-  }
-
-  private renderDetectedItemsPanel(parentEl: HTMLElement, msg: Message): void {
-    const msgId = msg.id;
-    if (!msgId) return;
-
-    const visible = this.showAllDetectedItems
-      ? this.detectedItems
-      : this.detectedItems.filter((i) => i.status === "pending");
-
-    if (visible.length === 0) return;
-
-    const panelEl = parentEl.createDiv({ cls: "iris-detected-items-panel" });
-
-    // Items
-    const listEl = panelEl.createDiv({ cls: "iris-detected-items-list" });
-
-    for (const item of visible) {
-      const cardEl = listEl.createDiv({
-        cls: `iris-detected-item-card is-${item.status}`,
-      });
-
-      // Icon
-      const iconEl = cardEl.createSpan({ cls: "iris-detected-item-icon" });
-      setIcon(iconEl, item.type === "event" ? "calendar" : "check-square");
-
-      // Check if this card is being edited
-      const isEditing = this.editingItemId === item.itemId;
-
-      if (isEditing) {
-        this.renderEditableCard(cardEl, msgId, item);
-      } else {
-        this.renderReadonlyCard(cardEl, msgId, item);
-      }
-    }
-  }
-
-  /** Render a card in its normal read-only state with action buttons. */
-  private renderReadonlyCard(cardEl: HTMLElement, msgId: string, item: DetectedItemEntry): void {
-    const contentEl = cardEl.createDiv({ cls: "iris-detected-item-content" });
-    contentEl.createDiv({ cls: "iris-detected-item-title", text: item.title });
-
-    const metaEl = contentEl.createDiv({ cls: "iris-detected-item-meta" });
-    if (item.type === "event") {
-      if (item.date) metaEl.createSpan({ text: formatItemDate(item.date) });
-      if (item.time) metaEl.createSpan({ text: item.time });
-      if (item.location) metaEl.createSpan({ text: item.location });
-    } else {
-      if (item.dueDate) metaEl.createSpan({ text: `Due: ${formatItemDate(item.dueDate)}` });
-    }
-
-    if (item.description) {
-      contentEl.createDiv({ cls: "iris-detected-item-desc", text: item.description });
-    }
-
-    if (item.status === "accepted" && item.vaultPath) {
-      const pathEl = contentEl.createDiv({ cls: "iris-detected-item-path" });
-      setIcon(pathEl.createSpan(), "check");
-      pathEl.createSpan({ text: item.vaultPath });
-    }
-
-    // Actions
-    if (item.status === "pending") {
-      const actionsEl = cardEl.createDiv({ cls: "iris-detected-item-actions" });
-
-      const acceptBtn = actionsEl.createEl("button", {
-        cls: "iris-detected-item-btn iris-detected-item-accept clickable-icon",
-        attr: { "aria-label": "Accept" },
-      });
-      setIcon(acceptBtn, "check");
-      acceptBtn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        this.callbacks.onAcceptDetectedItem(msgId, item);
-      });
-
-      const editBtn = actionsEl.createEl("button", {
-        cls: "iris-detected-item-btn iris-detected-item-edit clickable-icon",
-        attr: { "aria-label": "Edit" },
-      });
-      setIcon(editBtn, "pencil");
-      editBtn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        this.editingItemId = item.itemId;
-        this.rebuildView();
-      });
-
-      const dismissBtn = actionsEl.createEl("button", {
-        cls: "iris-detected-item-btn iris-detected-item-dismiss clickable-icon",
-        attr: { "aria-label": "Dismiss" },
-      });
-      setIcon(dismissBtn, "x");
-      dismissBtn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        this.callbacks.onDismissDetectedItem(msgId, item.itemId);
-      });
-    }
-  }
-
-  /** Render a card with all fields as inline editable inputs. */
-  private renderEditableCard(cardEl: HTMLElement, msgId: string, item: DetectedItemEntry): void {
-    cardEl.addClass("is-editing");
-
-    const contentEl = cardEl.createDiv({ cls: "iris-detected-item-content" });
-
-    // Row 1: Title + meta fields on a single line
-    const topRow = contentEl.createDiv({ cls: "iris-detected-item-edit-row" });
-
-    const titleInput = topRow.createEl("input", {
-      cls: "iris-detected-item-inline-input iris-detected-item-inline-title",
-      attr: { type: "text", value: item.title, placeholder: "Title" },
-    });
-
-    let dateInput: HTMLInputElement | undefined;
-    let timeInput: HTMLInputElement | undefined;
-    let locationInput: HTMLInputElement | undefined;
-    let dueDateInput: HTMLInputElement | undefined;
-
-    if (item.type === "event") {
-      dateInput = topRow.createEl("input", {
-        cls: "iris-detected-item-inline-input iris-detected-item-inline-meta",
-        attr: { type: "text", value: item.date || "", placeholder: "YYYY-MM-DD or range" },
-      });
-      timeInput = topRow.createEl("input", {
-        cls: "iris-detected-item-inline-input iris-detected-item-inline-meta",
-        attr: { type: "time", value: item.time || "" },
-      });
-      // Location on its own row for events (needs more space)
-      locationInput = contentEl.createEl("input", {
-        cls: "iris-detected-item-inline-input iris-detected-item-inline-location",
-        attr: { type: "text", value: item.location || "", placeholder: "Location" },
-      });
-    } else {
-      dueDateInput = topRow.createEl("input", {
-        cls: "iris-detected-item-inline-input iris-detected-item-inline-meta",
-        attr: { type: "text", value: item.dueDate || "", placeholder: "YYYY-MM-DD or range" },
-      });
-    }
-
-    // Description - inline editable textarea
-    const descInput = contentEl.createEl("textarea", {
-      cls: "iris-detected-item-inline-input iris-detected-item-inline-desc",
-      attr: { placeholder: "Description", rows: "2" },
-    });
-    descInput.value = item.description || "";
-
-    // Action buttons row
-    const btnRow = contentEl.createDiv({ cls: "iris-detected-item-inline-actions" });
-
-    const collectUpdates = (): Partial<DetectedItemEntry> => {
-      const updates: Partial<DetectedItemEntry> = {
-        title: titleInput.value.trim(),
-        description: descInput.value.trim(),
-      };
-      if (item.type === "event") {
-        updates.date = dateInput?.value || "";
-        updates.time = timeInput?.value || "";
-        updates.location = locationInput?.value.trim() || "";
-      } else {
-        updates.dueDate = dueDateInput?.value || "";
-      }
-      return updates;
-    };
-
-    const saveBtn = btnRow.createEl("button", {
-      cls: "iris-detected-item-btn iris-detected-item-save clickable-icon",
-      attr: { "aria-label": "Save changes" },
-    });
-    setIcon(saveBtn, "check");
-    saveBtn.createSpan({ text: "Save" });
-    saveBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      this.callbacks.onUpdateDetectedItem(msgId, item.itemId, collectUpdates());
-      this.editingItemId = null;
-      this.rebuildView();
-    });
-
-    const acceptBtn = btnRow.createEl("button", {
-      cls: "iris-detected-item-btn iris-detected-item-accept clickable-icon",
-      attr: { "aria-label": "Save & Accept" },
-    });
-    setIcon(acceptBtn, "check-check");
-    acceptBtn.createSpan({ text: "Save & Accept" });
-    acceptBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      const updates = collectUpdates();
-      this.callbacks.onUpdateDetectedItem(msgId, item.itemId, updates);
-      const updated = { ...item, ...updates };
-      this.editingItemId = null;
-      this.callbacks.onAcceptDetectedItem(msgId, updated as DetectedItemEntry);
-    });
-
-    const cancelBtn = btnRow.createEl("button", {
-      cls: "iris-detected-item-btn iris-detected-item-cancel clickable-icon",
-      attr: { "aria-label": "Cancel" },
-    });
-    setIcon(cancelBtn, "x");
-    cancelBtn.createSpan({ text: "Cancel" });
-    cancelBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      this.editingItemId = null;
-      this.rebuildView();
-    });
-
-    // Auto-focus the title input
-    requestAnimationFrame(() => titleInput.focus());
   }
 
   /** Create a dropdown anchored to an element with auto-close on outside click. */
@@ -832,7 +645,21 @@ export class MessageViewer {
       span.addEventListener("contextmenu", (evt) => {
         evt.preventDefault();
         evt.stopPropagation();
-        this.callbacks.onEditNickname(address, rawName);
+
+        const menu = new Menu();
+        menu.addItem((item) =>
+          item
+            .setTitle("Edit nickname…")
+            .setIcon("pencil")
+            .onClick(() => this.callbacks.onEditNickname(address, rawName)),
+        );
+        menu.addItem((item) =>
+          item
+            .setTitle("Block")
+            .setIcon("trash-2")
+            .onClick(() => this.callbacks.onMarkSenderAsJunk(address, rawName)),
+        );
+        menu.showAtMouseEvent(evt);
       });
     }
     return span;

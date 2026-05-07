@@ -1,6 +1,6 @@
 import { App, PluginSettingTab, Setting, setIcon } from "obsidian";
 import type IrisMailPlugin from "../main";
-import { DEFAULT_CLAUDE_PROMPT, TAG_CLASSIFY_PROMPT, TAG_ICON_POOL, ITEM_DETECTION_PROMPT, parseTagCategories, bumpTagVersion, setTagContradictions, removeTagFromContradictions, setTagPrecludesList, setPrecludedByFor, getPrecludedBy, removeTagFromPrecludes, MSAL_AUTHORITY_DEFAULT } from "../constants";
+import { DEFAULT_CLAUDE_PROMPT, TAG_CLASSIFY_PROMPT, TAG_ICON_POOL, parseTagCategories, bumpTagVersion, setTagContradictions, removeTagFromContradictions, setTagPrecludesList, setPrecludedByFor, getPrecludedBy, removeTagFromPrecludes, MSAL_AUTHORITY_DEFAULT } from "../constants";
 import { CreateTagModal } from "../views/components/CreateTagModal";
 import { generateTagDescription, hasClaudeAccess, pickTagIcon } from "../utils/claudeApi";
 import { setDebugEnabled } from "../utils/logger";
@@ -93,6 +93,22 @@ export class IrisMailSettingsTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName("Sync window (days)")
+      .setDesc("Only fetch messages received within this many days. 0 = unlimited.")
+      .addText((text) =>
+        text
+          .setPlaceholder("30")
+          .setValue(String(this.plugin.settings.initialSyncLookbackDays))
+          .onChange(async (value) => {
+            const days = parseInt(value, 10);
+            if (!isNaN(days) && days >= 0) {
+              this.plugin.settings.initialSyncLookbackDays = days;
+              this.plugin.scheduleSaveSettings();
+            }
+          }),
+      );
+
+    new Setting(containerEl)
       .setName("Show read emails")
       .setDesc("If disabled, only unread messages are shown.")
       .addToggle((toggle) =>
@@ -120,17 +136,12 @@ export class IrisMailSettingsTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Ribbon badge")
-      .setDesc("What to show on the ribbon icon badge.")
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOptions({
-            off: "Off",
-            unread: "Unread count",
-            total: "Total messages",
-          })
+      .setDesc("Show the In-box (unread) count on the ribbon icon.")
+      .addToggle((toggle) =>
+        toggle
           .setValue(this.plugin.settings.badgeCount)
           .onChange(async (value) => {
-            this.plugin.settings.badgeCount = value as "off" | "unread" | "total";
+            this.plugin.settings.badgeCount = value;
             this.plugin.scheduleSaveSettings();
             this.plugin.updateBadge(-1); // signal a re-sync
           }),
@@ -275,30 +286,6 @@ export class IrisMailSettingsTab extends PluginSettingTab {
             this.plugin.scheduleSaveSettings();
           }),
       );
-
-    {
-      const promptSetting = new Setting(containerEl)
-        .setName("Detection prompt")
-        .setDesc("Custom prompt for extracting events and tasks. Leave blank for default.");
-
-      promptSetting.addTextArea((area) =>
-        area
-          .setPlaceholder(ITEM_DETECTION_PROMPT.slice(0, 120) + "…")
-          .setValue(this.plugin.settings.itemDetectionPrompt)
-          .onChange(async (value) => {
-            this.plugin.settings.itemDetectionPrompt = value;
-            this.plugin.scheduleSaveSettings();
-          }),
-      );
-
-      promptSetting.addButton((btn) =>
-        btn.setButtonText("Reset").onClick(async () => {
-          this.plugin.settings.itemDetectionPrompt = "";
-          this.plugin.scheduleSaveSettings();
-          this.display();
-        }),
-      );
-    }
 
     // Tag Classification section
     containerEl.createEl("h3", { text: "Tag Classification" });
@@ -587,9 +574,16 @@ export class IrisMailSettingsTab extends PluginSettingTab {
 
     // Per-provider credentials
     if (account.provider === "outlook") {
+      const entraDesc = document.createDocumentFragment();
+      entraDesc.appendText("Application (client) ID from your ");
+      entraDesc.createEl("a", {
+        text: "Azure Entra app registration",
+        href: "https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade",
+      });
+      entraDesc.appendText(".");
       new Setting(wrap)
         .setName("Azure Client ID")
-        .setDesc("Application (client) ID from your Azure Entra app registration.")
+        .setDesc(entraDesc)
         .addText((text) =>
           text
             .setPlaceholder("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")

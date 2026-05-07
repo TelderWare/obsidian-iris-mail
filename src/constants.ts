@@ -1,7 +1,24 @@
-import type { IrisMailSettings } from "./types";
+import type { Box, IrisMailSettings } from "./types";
+
+/** Seeded box set used for new installs and when migrating old settings. */
+export const DEFAULT_BOXES: Box[] = [
+  { id: "in", name: "In", icon: "inbox", builtin: "in" },
+  { id: "read", name: "Read", icon: "mail-open", builtin: "read" },
+  { id: "todo", name: "To-do", icon: "check-square", builtin: "todo", saved: true },
+  { id: "junk", name: "Junk", icon: "shield-x", builtin: "junk" },
+  { id: "secretary", name: "Secretary", icon: "brain-circuit", builtin: "secretary" },
+];
+
+/** Return a fresh copy of the default boxes (arrays are per-install mutable). */
+export function freshDefaultBoxes(): Box[] {
+  return DEFAULT_BOXES.map((b) => ({ ...b }));
+}
 
 export const VIEW_TYPE_IRIS_MAIL = "iris-mail-view";
 export const ICON_NAME = "mail";
+
+/** Class applied to the view container when the user pins single-pane layout via `f`. */
+export const COMPACT_MODE_CLASS = "iris-compact";
 
 export const GRAPH_SCOPES = ["Mail.ReadWrite", "User.Read"];
 export const MSAL_AUTHORITY_DEFAULT = "https://login.microsoftonline.com/common";
@@ -14,8 +31,9 @@ export const DEFAULT_SETTINGS: IrisMailSettings = {
   redirectPort: 3847,
   refreshIntervalMinutes: 5,
   pageSize: 25,
+  initialSyncLookbackDays: 30,
   showReadEmails: true,
-  badgeCount: "unread",
+  badgeCount: true,
   badgePosition: "bottom-left",
   enableClaudeProcessing: false,
   anthropicApiKey: "",
@@ -36,11 +54,10 @@ export const DEFAULT_SETTINGS: IrisMailSettings = {
   resolveForwardedSender: false,
   eventNoteFolderPath: "Events",
   taskNoteFolderPath: "Tasks",
-  itemDetectionPrompt: "",
   senderRules: {},
-  viewMode: "messages",
   sortNewestFirst: true,
-  filterUnreadOnly: true,
+  boxes: freshDefaultBoxes(),
+  selectedBoxId: "in",
   debugLogging: false,
 };
 
@@ -117,26 +134,6 @@ export const TAG_CLASSIFY_PROMPT =
   "- Answer with a single word: yes or no\n" +
   "- If the definition is empty or ambiguous, answer no\n" +
   "- Be conservative — answer yes only if you are confident the definition applies";
-
-export const ITEM_DETECTION_PROMPT =
-  "You scan emails for calendar events and actionable tasks.\n" +
-  "Analyze the ENTIRE email body. An email may contain multiple events and/or tasks, or none at all.\n\n" +
-  "Return ONLY valid JSON: an array of objects. Each object has:\n" +
-  '- "type": "event" or "task"\n' +
-  '- "title": short descriptive title\n' +
-  '- "date": "YYYY-MM-DD" or "YYYY-MM-DD/YYYY-MM-DD" for a date range (for events, required if determinable)\n' +
-  '- "time": "HH:MM" (for events, if mentioned)\n' +
-  '- "location": string (for events, if mentioned)\n' +
-  '- "dueDate": "YYYY-MM-DD" or "YYYY-MM-DD/YYYY-MM-DD" for a date range (for tasks, if determinable)\n' +
-  '- "description": 1-2 sentence summary\n' +
-  '- "sourceText": the exact excerpt from the email body that this item was detected from (copy verbatim, keep it short — just the key phrase or sentence, not entire paragraphs)\n\n' +
-  "Use the email date to resolve relative references (tomorrow, next week, etc.).\n" +
-  "Use date ranges when the email describes a span of time (e.g. \"week commencing 13 April\" → \"2026-04-13/2026-04-17\", \"between 1 June and 30 June\" → \"2026-06-01/2026-06-30\").\n" +
-  "Omit fields that don't apply (no time on tasks, no dueDate on events).\n" +
-  "If the email contains no events or tasks, return an empty array: []\n" +
-  "Be conservative — only extract clear, actionable items. Do not invent items.\n" +
-  "IMPORTANT: Only extract tasks that are actionable by the recipient (the user reading the email). " +
-  "Do NOT extract tasks assigned to or owned by other people mentioned in the email.";
 
 export const CACHE_STORAGE_KEY = "iris-mail-msal-cache";
 

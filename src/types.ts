@@ -19,7 +19,6 @@ export type Message = MicrosoftGraph.Message & {
 // Plugin settings
 export type MailProvider = "outlook" | "imap";
 export type AuthMethod = "auth-code" | "device-code";
-export type BadgeCountMode = "off" | "unread" | "total";
 export type BadgePosition = "top-right" | "top-left" | "bottom-right" | "bottom-left" | "off";
 
 /**
@@ -46,14 +45,45 @@ export interface Account {
   imapPreset?: string;
 }
 
+export type BoxBuiltin = "in" | "read" | "todo" | "junk" | "secretary";
+
+/**
+ * A named view over the message list. Built-in boxes have a fixed predicate
+ * keyed off per-message state (isRead / isTodo / isJunk / classifier in-flight).
+ * User boxes are predicated on `tags`: a message is in the box if it carries
+ * any of the listed tags. Built-in boxes may also carry extra `tags` to widen
+ * their predicate — e.g. tagging a message `task` can feed it into the built-in
+ * to-do box.
+ */
+export interface Box {
+  id: string;
+  name: string;
+  icon: string;
+  color?: string;
+  builtin?: BoxBuiltin;
+  tags?: string[];
+  /** When true, the box is omitted from the box strip. Restored via the "+" menu. */
+  hidden?: boolean;
+  /**
+   * When true, messages matching this box's predicate have their envelopes
+   * persisted in the cache so they stay visible even after they age out of
+   * the server's sync window. Meaningful only for boxes whose predicate is
+   * driven by locally-tracked state (todo, junk, user tag boxes); silently
+   * ignored for in / read / secretary.
+   */
+  saved?: boolean;
+}
+
 export interface IrisMailSettings {
   accounts: Account[];
   redirectPort: number;
   refreshIntervalMinutes: number;
   pageSize: number;
+  /** Sync window in days — messages older than this are not fetched. 0 = unlimited. */
+  initialSyncLookbackDays: number;
   showReadEmails: boolean;
-  /** What the ribbon badge displays. */
-  badgeCount: BadgeCountMode;
+  /** Whether the ribbon badge shows the In-box (unread) count. */
+  badgeCount: boolean;
   /** Where the ribbon badge is positioned. */
   badgePosition: BadgePosition;
   enableClaudeProcessing: boolean;
@@ -90,14 +120,14 @@ export interface IrisMailSettings {
   eventNoteFolderPath: string;
   /** Folder for auto-created task notes. */
   taskNoteFolderPath: string;
-  /** Custom prompt for event/task extraction (overrides default). */
-  itemDetectionPrompt: string;
   /** Per-sender automation rules, keyed by lowercased email address. */
   senderRules: Record<string, SenderRule>;
   // Persisted view state
-  viewMode: "messages" | "senders";
   sortNewestFirst: boolean;
-  filterUnreadOnly: boolean;
+  /** Ordered list of boxes shown in the box strip. */
+  boxes: Box[];
+  /** Currently selected box id. */
+  selectedBoxId: string;
   /** Enable debug logging to console. */
   debugLogging: boolean;
 }
@@ -108,17 +138,6 @@ export interface SenderRule {
   autoBin?: boolean;
   /** Apply this tag to new messages on arrival. Empty string = none. */
   autoTag?: string;
-}
-
-// Sender grouping
-export interface SenderGroup {
-  /** Stable key used to identify this group (may differ from address for via senders). */
-  groupKey: string;
-  address: string;
-  name: string;
-  messages: Message[];
-  latestMessage: Message;
-  unreadCount: number;
 }
 
 // Internal UI state

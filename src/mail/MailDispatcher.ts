@@ -57,6 +57,7 @@ export class MailDispatcher implements MailApi {
           search: options.search,
           unreadOnly: options.unreadOnly,
           nextLink: cursors[entry.account.id],
+          since: options.since,
         });
         logger.debug("MailDispatcher", `${entry.account.label}: ${resp.value.length} messages, nextLink=${resp.nextLink ?? "-"}`);
         for (const m of resp.value) this.stamp(m, entry);
@@ -71,7 +72,14 @@ export class MailDispatcher implements MailApi {
       (r): r is { accountId: string; value: Message[]; nextLink: string | null } => r !== null,
     );
 
-    const merged = results.flatMap((r) => r.value);
+    const mergedById = new Map<string, Message>();
+    for (const r of results) {
+      for (const m of r.value) {
+        if (!m.id) continue;
+        if (!mergedById.has(m.id)) mergedById.set(m.id, m);
+      }
+    }
+    const merged = [...mergedById.values()];
     merged.sort(byReceivedDesc);
 
     const nextCursors: Record<string, string> = {};

@@ -12,6 +12,8 @@ export interface ListMessagesOptions {
   unreadOnly?: boolean;
   /** Opaque pagination cursor returned from a prior MailListResponse. */
   nextLink?: string;
+  /** Only return messages received on or after this instant. Omit = no lower bound. */
+  since?: Date;
 }
 
 /**

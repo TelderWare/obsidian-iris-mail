@@ -7,3 +7,5 @@ email-body-cache.json
 
 # Obsidian plugin data
 data.json
+
+.claude/

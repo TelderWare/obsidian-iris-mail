@@ -50,8 +50,11 @@ export class OutlookMailApi implements MailApi {
       if (options.search) {
         request = request.search(`"${options.search}"`);
       }
-      if (options.unreadOnly) {
-        request = request.filter("isRead eq false");
+      const filters: string[] = [];
+      if (options.unreadOnly) filters.push("isRead eq false");
+      if (options.since) filters.push(`receivedDateTime ge ${options.since.toISOString()}`);
+      if (filters.length > 0) {
+        request = request.filter(filters.join(" and "));
       }
 
       response = await request.get();
